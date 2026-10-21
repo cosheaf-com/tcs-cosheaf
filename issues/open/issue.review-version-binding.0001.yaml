@@ -1,0 +1,21 @@
+id: issue.review-version-binding.0001
+type: issue
+title: 'P1: Review applies to old content, but can be carried over to modified content'
+status: open
+authors:
+- operator
+severity: high
+description: 'Currently, editing an artifact retains the existing `review`, allowing
+  changes to `statement`, `depends_on`, etc., without invalidating the review. The
+  promotion only checks `review.state` without verifying the content version. Artifacts
+  need an explicit revision or semantic content hash, and reviews/evidence must be
+  bound to a specific revision. Promotion should recalculate eligibility for new versions.
+
+  '
+tags:
+- architecture
+- p1
+- phase-1
+- knowledge-policy
+created_at: '2026-10-21T07:02:26Z'
+updated_at: '2026-10-21T07:02:26Z'

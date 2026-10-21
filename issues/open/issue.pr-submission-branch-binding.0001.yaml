@@ -1,0 +1,22 @@
+id: issue.pr-submission-branch-binding.0001
+type: issue
+title: 'P1: PR submission flow may validate one branch but push another'
+status: open
+authors:
+- operator
+severity: high
+description: '`github_pr_submit()` validates the current working directory but pushes
+  the parameter-specified `head` branch without ensuring they point to the same commit.
+  Validation results must be bound to a specific commit SHA (Parse SHA -> Validate
+  SHA -> Push SHA -> Create PR). In the short term, require the current branch to
+  equal the target head, the working tree to be clean, and HEAD unchanged before and
+  after validation.
+
+  '
+tags:
+- architecture
+- p1
+- phase-1
+- forge
+created_at: '2026-10-21T07:02:26Z'
+updated_at: '2026-10-21T07:02:26Z'
