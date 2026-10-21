@@ -55,7 +55,11 @@ from cosheaf.compare import (
     compare_campaigns,
     compare_workflows,
 )
-from cosheaf.config.workspace import KbRootConfig, WorkspaceConfigError
+from cosheaf.config.workspace import (
+    KbRootConfig,
+    WorkspaceConfigError,
+    infer_kb_visibility,
+)
 from cosheaf.context_cli import context_app
 from cosheaf.core.artifact import (
     BaseArtifact,
@@ -207,6 +211,7 @@ from cosheaf.services import (
     DraftWriteServiceError,
     FailureLogFromBundlePlanResult,
     FailureLogFromBundleWriteResult,
+    KbRootInfo,
     MemorySearchService,
     ServiceError,
     TaskService,
@@ -5725,14 +5730,24 @@ def _workspace_info_to_agent_result(
     )
 
 
-def _kb_root_scope(root: KbRootConfig) -> MemoryRootScope:
-    if root.is_private:
+def _kb_root_scope(root: KbRootConfig | KbRootInfo) -> MemoryRootScope:
+    is_private = getattr(
+        root,
+        "is_private",
+        infer_kb_visibility(root.name, root.path) == "private",
+    )
+    if is_private:
         return MemoryRootScope.PRIVATE
     name = root.name.lower()
     if name == "framework":
         return MemoryRootScope.FRAMEWORK
+    is_public = getattr(
+        root,
+        "is_public",
+        infer_kb_visibility(root.name, root.path) == "public",
+    )
     if name == "public" or (
-        root.is_public and name not in {"", "default", "workspace"}
+        is_public and name not in {"", "default", "workspace"}
     ):
         return MemoryRootScope.PUBLIC
     return MemoryRootScope.WORKSPACE

@@ -97,6 +97,15 @@ class KbRootInfo:
     path: str
     readonly: bool
     priority: int
+    visibility: str = "public"
+
+    @property
+    def is_private(self) -> bool:
+        return self.visibility == "private"
+
+    @property
+    def is_public(self) -> bool:
+        return self.visibility == "public"
 
 
 @dataclass(frozen=True)
@@ -286,6 +295,7 @@ class WorkspaceService:
                     path=root.path,
                     readonly=root.readonly,
                     priority=root.priority,
+                    visibility="private" if root.is_private else "public",
                 )
                 for root in config.ordered_kb
             ),
