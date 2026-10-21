@@ -441,15 +441,52 @@ class OrchestratorHostedRunner:
         provider_run_record_paths: list[Path] = []
 
         active_config = provider_config or _default_provider_config(resolved_provider)
+        completed_nodes: dict[str, _HostedNodeExecution] = {}
         for index, node in enumerate(plan.task_dag.nodes, start=1):
+            missing_deps = [
+                dep_id
+                for dep_id in node.depends_on
+                if dep_id not in completed_nodes
+            ]
+            if missing_deps:
+                stop_conditions.append(
+                    StopCondition(
+                        reason="unsatisfied_node_dependency",
+                        description=(
+                            f"{node.node_id} missing upstream dependencies: "
+                            + ", ".join(missing_deps)
+                        ),
+                    )
+                )
+                break
+            upstream_executions = [
+                completed_nodes[dep_id] for dep_id in node.depends_on
+            ]
+            node_artifact_ids = _merge_upstream_artifact_ids(
+                preview.artifact_ids,
+                node.input_artifacts,
+                upstream_executions,
+            )
+            upstream_bundle_paths = _collect_upstream_bundle_paths(
+                upstream_executions
+            )
+            upstream_proposed_paths = _collect_upstream_proposed_paths(
+                upstream_executions
+            )
             role = _role_for_node(node)
             worker_output = self.hosted_workers.run(
                 HostedWorkerInput(
                     issue_id=config.issue_id,
                     role=role,
-                    prompt=_hosted_worker_prompt(plan.objective, node),
-                    context_artifact_ids=list(preview.artifact_ids),
+                    prompt=_hosted_worker_prompt(
+                        plan.objective,
+                        node,
+                        upstream_executions=upstream_executions,
+                    ),
+                    context_artifact_ids=node_artifact_ids,
                     root_scopes=[scope.value for scope in preview.root_scopes],
+                    upstream_bundle_paths=upstream_bundle_paths,
+                    upstream_proposed_paths=upstream_proposed_paths,
                     consent=consent,
                 ),
                 config=active_config,
@@ -466,14 +503,27 @@ class OrchestratorHostedRunner:
                 provider_run_record_paths.append(provider_log_copy)
 
             bundle_path = None
+            typed_result_path = None
             if worker_output.bundle is not None:
                 bundle_path = _hosted_bundle_path(run_root, node)
                 write_yaml_deterministic(bundle_path, worker_output.bundle)
             elif worker_output.typed_result is not None:
+                typed_result_path = _hosted_typed_result_path(run_root, node)
                 write_yaml_deterministic(
-                    _hosted_typed_result_path(run_root, node),
+                    typed_result_path,
                     worker_output.typed_result,
                 )
+
+            rel_bundle_path = (
+                repo_relative_posix(self.context.repo_root, bundle_path)
+                if bundle_path is not None
+                else None
+            )
+            rel_typed_result_path = (
+                repo_relative_posix(self.context.repo_root, typed_result_path)
+                if typed_result_path is not None
+                else None
+            )
 
             worker_calls.append(
                 WorkerCall(
@@ -493,9 +543,7 @@ class OrchestratorHostedRunner:
                     exit_code=0
                     if worker_output.status is HostedWorkerStatus.COMPLETED
                     else 1,
-                    bundle_path=repo_relative_posix(self.context.repo_root, bundle_path)
-                    if bundle_path is not None
-                    else None,
+                    bundle_path=rel_bundle_path,
                     notes=_hosted_worker_notes(worker_output),
                 )
             )
@@ -508,24 +556,33 @@ class OrchestratorHostedRunner:
                 )
                 break
 
-            if worker_output.bundle is None or bundle_path is None:
-                continue
-            try:
-                reducer_results.append(
-                    reduce_worker_bundle_v2(
-                        self.context,
-                        bundle_path,
-                        reducer_id=validate_artifact_id(f"reducer.{node.node_id}"),
+            if worker_output.bundle is not None and bundle_path is not None:
+                try:
+                    reducer_results.append(
+                        reduce_worker_bundle_v2(
+                            self.context,
+                            bundle_path,
+                            reducer_id=validate_artifact_id(
+                                f"reducer.{node.node_id}"
+                            ),
+                        )
                     )
-                )
-            except WorkerBundleV2Error as exc:
-                stop_conditions.append(
-                    StopCondition(
-                        reason="worker_bundle_invalid",
-                        description=str(exc),
+                except WorkerBundleV2Error as exc:
+                    stop_conditions.append(
+                        StopCondition(
+                            reason="worker_bundle_invalid",
+                            description=str(exc),
+                        )
                     )
-                )
-                break
+                    break
+
+            completed_nodes[node.node_id] = _HostedNodeExecution(
+                node=node,
+                role=role,
+                output=worker_output,
+                bundle_path=rel_bundle_path,
+                typed_result_path=rel_typed_result_path,
+            )
 
         terminal_state = (
             OrchestratorState.FAILED if stop_conditions else OrchestratorState.COMPLETED
@@ -680,15 +737,121 @@ def _role_for_node(node: TaskNode) -> RoleName:
     return RoleName.EXPLORER
 
 
-def _hosted_worker_prompt(objective: str, node: TaskNode) -> str:
-    return "\n".join(
-        [
-            f"Objective: {objective}",
-            f"Task node: {node.node_id}",
-            f"Description: {node.description}",
-            "Return review-only output for this orchestrator run.",
-        ]
-    )
+@dataclass(frozen=True)
+class _HostedNodeExecution:
+    node: TaskNode
+    role: RoleName
+    output: HostedWorkerOutput
+    bundle_path: str | None = None
+    typed_result_path: str | None = None
+
+
+def _merge_upstream_artifact_ids(
+    preview_artifact_ids: Sequence[str],
+    node_input_artifacts: Sequence[str],
+    upstream_executions: Sequence[_HostedNodeExecution],
+) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    candidates: list[str] = [
+        *preview_artifact_ids,
+        *node_input_artifacts,
+    ]
+    for up in upstream_executions:
+        if up.output.bundle is not None:
+            candidates.extend(up.output.bundle.used_artifacts)
+        if up.output.typed_result is not None:
+            candidates.extend(up.output.typed_result.selected_artifacts)
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+    return merged
+
+
+def _collect_upstream_bundle_paths(
+    upstream_executions: Sequence[_HostedNodeExecution],
+) -> list[str]:
+    paths: list[str] = []
+    for up in upstream_executions:
+        if up.bundle_path is not None and up.bundle_path not in paths:
+            paths.append(up.bundle_path)
+        if up.typed_result_path is not None and up.typed_result_path not in paths:
+            paths.append(up.typed_result_path)
+    return paths
+
+
+def _collect_upstream_proposed_paths(
+    upstream_executions: Sequence[_HostedNodeExecution],
+) -> list[str]:
+    paths: list[str] = []
+    for up in upstream_executions:
+        if up.output.bundle is None:
+            continue
+        for proposed in up.output.bundle.proposed_artifacts:
+            if proposed.path not in paths:
+                paths.append(proposed.path)
+    return paths
+
+
+def _hosted_worker_prompt(
+    objective: str,
+    node: TaskNode,
+    *,
+    upstream_executions: Sequence[_HostedNodeExecution] = (),
+) -> str:
+    lines = [
+        f"Objective: {objective}",
+        f"Task node: {node.node_id}",
+        f"Description: {node.description}",
+    ]
+    if upstream_executions:
+        lines.append(
+            "Upstream dependencies: "
+            + ", ".join(up.node.node_id for up in upstream_executions)
+        )
+        for up in upstream_executions:
+            if up.bundle_path is not None:
+                lines.append(
+                    f"Upstream bundle ({up.node.node_id}, {up.role.value}): "
+                    f"{up.bundle_path}"
+                )
+            elif up.typed_result_path is not None:
+                lines.append(
+                    f"Upstream typed result ({up.node.node_id}, {up.role.value}): "
+                    f"{up.typed_result_path}"
+                )
+            if up.output.bundle is not None:
+                lines.append(
+                    f"Upstream summary ({up.node.node_id}): "
+                    f"{up.output.bundle.summary}"
+                )
+                if up.output.bundle.claims:
+                    lines.append(
+                        f"Upstream claims ({up.node.node_id}): "
+                        + "; ".join(up.output.bundle.claims)
+                    )
+                if up.output.bundle.proposed_artifacts:
+                    lines.append(
+                        f"Upstream proposed drafts ({up.node.node_id}): "
+                        + ", ".join(
+                            prop.path
+                            for prop in up.output.bundle.proposed_artifacts
+                        )
+                    )
+                if up.output.bundle.verification_requests:
+                    lines.append(
+                        f"Upstream verification requests ({up.node.node_id}): "
+                        + "; ".join(up.output.bundle.verification_requests)
+                    )
+            elif up.output.typed_result is not None:
+                lines.append(
+                    f"Upstream summary ({up.node.node_id}): "
+                    f"{up.output.typed_result.summary}"
+                )
+    lines.append("Return review-only output for this orchestrator run.")
+    return "\n".join(lines)
 
 
 def _hosted_bundle_path(run_root: Path, node: TaskNode) -> Path:

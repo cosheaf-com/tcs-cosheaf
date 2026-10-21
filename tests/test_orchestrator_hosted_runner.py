@@ -415,3 +415,116 @@ def test_hosted_orchestrator_reducer_rejects_unsafe_provider_bundle(
         "human_reviewed" in stop.description for stop in result.run.stop_conditions
     )
     assert not (tmp_path / "kb" / "accepted").exists()
+
+
+def test_hosted_orchestrator_propagates_upstream_outputs_to_dependent_nodes(
+    tmp_path: Path,
+) -> None:
+    _write_repo(tmp_path)
+    captured_requests: list[Any] = []
+
+    class InspectingTransport:
+        def complete(self, request, config):  # type: ignore[no-untyped-def]
+            captured_requests.append(request)
+            role_slug = request.worker_role.value.replace("_", "-")
+            if request.worker_role in {
+                WorkerType.LITERATURE_SCOUT,
+                WorkerType.CONSTRUCTION_SEARCHER,
+            }:
+                return ProviderTransportResult(
+                    content=json.dumps(
+                        {
+                            "summary": f"Upstream {request.worker_role.value} summary.",
+                            "selected_artifacts": [
+                                *request.context_artifact_ids,
+                                f"claim.selected.{role_slug}",
+                            ],
+                            "notes": [f"Note from {request.worker_role.value}."],
+                            "risk_flags": ["needs_human_review"],
+                            "next_steps": ["Pass to reasoner."],
+                        }
+                    ),
+                    status=ProviderTransportStatus.COMPLETED,
+                )
+
+            proposed_path = (
+                "kb/draft/hosted-workers/reasoner-proposal.yaml"
+                if request.worker_role is WorkerType.REASONER
+                else "kb/draft/hosted-workers/verifier-check.yaml"
+            )
+            return ProviderTransportResult(
+                content=json.dumps(
+                    {
+                        "bundle_id": (
+                            "bundle.issue.fixture.hosted."
+                            f"{role_slug}.0001"
+                        ),
+                        "task_id": (
+                            "task.issue.fixture.hosted."
+                            f"{role_slug}"
+                        ),
+                        "worker_role": request.worker_role.value,
+                        "created_at": "2026-06-10T00:00:00Z",
+                        "summary": f"Bundle from {request.worker_role.value}.",
+                        "used_artifacts": [
+                            *request.context_artifact_ids,
+                            f"claim.used.{role_slug}",
+                        ],
+                        "used_sources": [],
+                        "claims": [f"Claim produced by {request.worker_role.value}."],
+                        "proposed_artifacts": [
+                            {
+                                "path": proposed_path,
+                                "summary": f"Draft from {request.worker_role.value}.",
+                            }
+                        ],
+                        "verification_requests": [
+                            f"Verify output of {request.worker_role.value}."
+                        ],
+                        "failures_or_counterexamples": ["None."],
+                        "risk_flags": ["needs_human_review"],
+                        "next_steps": ["Continue."],
+                        "confidence": "low",
+                    }
+                ),
+                status=ProviderTransportStatus.COMPLETED,
+                raw_metadata={"transport": "inspecting"},
+            )
+
+    result = OrchestratorHostedRunner(RepoContext(tmp_path)).run_issue(
+        OrchestratorHostedRunConfig(
+            issue_id="issue.fixture.hosted",
+            provider="openai-compatible",
+            confirm_send=True,
+            run_id="run.issue.fixture.hosted.propagation",
+        ),
+        provider_config=ProviderConfig(
+            provider=ProviderName.OPENAI,
+            mode=ProviderMode.OPENAI_COMPATIBLE,
+            model="mock-openai-compatible",
+            enabled=True,
+            api_key_env=None,
+        ),
+        provider=OpenAICompatibleProvider(transport=InspectingTransport()),
+    )
+
+    assert result.run.state.value == "completed"
+    assert len(captured_requests) == 4
+    reasoner_req = next(
+        req for req in captured_requests if req.worker_role is WorkerType.REASONER
+    )
+    verifier_req = next(
+        req for req in captured_requests if req.worker_role is WorkerType.VERIFIER
+    )
+    assert "claim.selected.literature-scout" in reasoner_req.context_artifact_ids
+    assert "claim.selected.literature-scout" in verifier_req.context_artifact_ids
+    assert "claim.used.reasoner" in verifier_req.context_artifact_ids
+    assert (
+        "kb/draft/hosted-workers/reasoner-proposal.yaml" in verifier_req.prompt
+    )
+    assert "Claim produced by reasoner." in verifier_req.prompt
+    assert "Verify output of reasoner." in verifier_req.prompt
+    assert (
+        "bundles/node.issue.fixture.hosted.reasoner-draft.yaml"
+        in verifier_req.prompt
+    )

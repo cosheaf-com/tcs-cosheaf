@@ -57,6 +57,8 @@ class HostedWorkerInput(BaseModel):
     prompt: str
     context_artifact_ids: list[str] = Field(default_factory=list)
     root_scopes: list[str] = Field(default_factory=list)
+    upstream_bundle_paths: list[str] = Field(default_factory=list)
+    upstream_proposed_paths: list[str] = Field(default_factory=list)
     consent: ProviderConsent
 
     @field_validator("issue_id")
@@ -85,6 +87,11 @@ class HostedWorkerInput(BaseModel):
     @field_validator("root_scopes")
     @classmethod
     def _root_scopes(cls, values: list[str]) -> list[str]:
+        return _dedupe(_non_empty(value) for value in values)
+
+    @field_validator("upstream_bundle_paths", "upstream_proposed_paths")
+    @classmethod
+    def _upstream_paths(cls, values: list[str]) -> list[str]:
         return _dedupe(_non_empty(value) for value in values)
 
 
@@ -296,22 +303,33 @@ def _bundle_worker_type(role: RoleName) -> WorkerType | None:
 
 def _worker_prompt(worker_input: HostedWorkerInput, role: RoleName) -> str:
     contract = get_role_contract(role)
-    return "\n".join(
-        [
-            contract.system_prompt,
-            "",
-            "Required output fields: "
-            + ", ".join(contract.required_output_schema.required_fields),
-            "Optional output fields: "
-            + ", ".join(contract.required_output_schema.optional_fields),
-            "Forbidden authority: " + ", ".join(contract.forbidden_actions),
-            "",
-            "Return review-only output. Do not write accepted knowledge, mark "
-            "human review, promote artifacts, or claim unchecked verification.",
-            "",
-            worker_input.prompt,
-        ]
-    )
+    upstream_lines: list[str] = []
+    if worker_input.upstream_bundle_paths:
+        upstream_lines.append(
+            "Upstream worker bundles: "
+            + ", ".join(worker_input.upstream_bundle_paths)
+        )
+    if worker_input.upstream_proposed_paths:
+        upstream_lines.append(
+            "Upstream proposed draft paths: "
+            + ", ".join(worker_input.upstream_proposed_paths)
+        )
+    lines = [
+        contract.system_prompt,
+        "",
+        "Required output fields: "
+        + ", ".join(contract.required_output_schema.required_fields),
+        "Optional output fields: "
+        + ", ".join(contract.required_output_schema.optional_fields),
+        "Forbidden authority: " + ", ".join(contract.forbidden_actions),
+        "",
+        "Return review-only output. Do not write accepted knowledge, mark "
+        "human review, promote artifacts, or claim unchecked verification.",
+    ]
+    if upstream_lines:
+        lines.extend(["", *upstream_lines])
+    lines.extend(["", worker_input.prompt])
+    return "\n".join(lines)
 
 
 def _expected_output_paths(

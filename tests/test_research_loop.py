@@ -902,3 +902,144 @@ def test_cli_json_smoke(tmp_path: Path) -> None:
     )
     assert finalize.exit_code == 0, finalize.output
     assert json.loads(finalize.output)["loop"]["status"] == "finalized"
+
+
+def test_research_loop_run_execute_local_actions_succeeds_in_process(
+    tmp_path: Path,
+) -> None:
+    """--execute-local-actions runs local actions in-process without subprocesses."""
+    import yaml  # type: ignore[import-untyped]
+
+    issue_dir = tmp_path / "issues" / "open"
+    issue_dir.mkdir(parents=True, exist_ok=True)
+    (issue_dir / "issue.test.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "issue.test",
+                "type": "issue",
+                "title": "Test issue for local actions",
+                "status": "open",
+                "created_at": "2026-04-12T00:00:00Z",
+                "updated_at": "2026-04-12T00:00:00Z",
+                "authors": ["tester"],
+                "severity": "medium",
+                "description": "Verify in-process local action execution.",
+                "related_artifacts": [],
+                "tags": ["test"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    context = RepoContext(tmp_path)
+    start_loop(
+        context,
+        issue_id="issue.test",
+        loop_id="loop.test",
+        budget=ResearchLoopBudget(max_attempts=3),
+    )
+
+    run_res = runner.invoke(
+        app,
+        [
+            "research-loop",
+            "run",
+            "loop.test",
+            "--execute-local-actions",
+            "--max-attempts",
+            "2",
+            "--wallclock-minutes",
+            "5",
+            "--repo-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+    assert run_res.exit_code == 0, run_res.output
+    payload = json.loads(run_res.output)
+    assert payload["mode"] == "local"
+    assert len(payload["planned_actions"]) == 1
+    assert all(
+        cond["kind"] != "action_failure" for cond in payload["stop_conditions"]
+    )
+
+
+def test_research_loop_run_execute_local_actions_exits_nonzero_on_failure(
+    tmp_path: Path,
+) -> None:
+    """When a local action fails, CLI exits non-zero and reports structured error."""
+    context = RepoContext(tmp_path)
+    start_loop(
+        context,
+        issue_id="issue.missing",
+        loop_id="loop.fail",
+        budget=ResearchLoopBudget(max_attempts=3),
+    )
+
+    run_res = runner.invoke(
+        app,
+        [
+            "research-loop",
+            "run",
+            "loop.fail",
+            "--execute-local-actions",
+            "--max-attempts",
+            "2",
+            "--wallclock-minutes",
+            "5",
+            "--repo-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+    assert run_res.exit_code == 1
+    payload = json.loads(run_res.output)
+    assert payload["stop_conditions"][0]["kind"] == "action_failure"
+    assert payload["stop_conditions"][0]["triggered"] is True
+    description = payload["stop_conditions"][0]["description"]
+    assert "memory.search" in description
+    assert "issue not found: issue.missing" in description
+
+
+def test_research_loop_run_execute_local_actions_respects_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    """Local action execution stops when max_attempts budget is already exhausted."""
+    context = RepoContext(tmp_path)
+    start_loop(
+        context,
+        issue_id="issue.missing",
+        loop_id="loop.exhausted",
+        budget=ResearchLoopBudget(max_attempts=1),
+    )
+    append_attempt(
+        context,
+        "loop.exhausted",
+        _failed_attempt().model_copy(
+            update={
+                "loop_id": "loop.exhausted",
+                "attempt_id": "loop.exhausted.attempt.1",
+            }
+        ),
+    )
+
+    run_res = runner.invoke(
+        app,
+        [
+            "research-loop",
+            "run",
+            "loop.exhausted",
+            "--execute-local-actions",
+            "--max-attempts",
+            "1",
+            "--wallclock-minutes",
+            "5",
+            "--repo-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+    assert run_res.exit_code == 0, run_res.output
+    payload = json.loads(run_res.output)
+    assert payload["stop_conditions"][0]["kind"] == "max_attempts"
+    assert payload["stop_conditions"][0]["triggered"] is True

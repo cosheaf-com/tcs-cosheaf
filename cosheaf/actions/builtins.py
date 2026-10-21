@@ -7,10 +7,11 @@ require network, or execute arbitrary shell by default.
 
 from __future__ import annotations
 
-import subprocess
-import sys
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal
 
 from cosheaf.actions.registry import (
     ActionFunc,
@@ -23,64 +24,61 @@ from cosheaf.actions.registry import (
     LocalActionSpec,
     LocalActionStatus,
 )
+from cosheaf.core.paths import repo_relative_posix
+from cosheaf.storage.repo import RepoContext
+
+ScannerStatus = Literal["clean", "blocked", "not_applicable"]
+_ExecReturn = tuple[
+    LocalActionStatus,
+    dict[str, str],
+    str,
+    LocalActionError | None,
+    ScannerStatus,
+]
 
 
-def _cosheaf_cli(argv: list[str], repo_root: Path) -> LocalActionResult:
-    """Run cosheaf CLI via subprocess in the repo root and return structured result."""
+def _run_typed_service(
+    action_id: str,
+    request: LocalActionRunRequest,
+    fn: Callable[[], _ExecReturn],
+) -> LocalActionResult:
     started_at = datetime.now(UTC)
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "cosheaf.cli"] + argv,
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            timeout=120,
-        )
+        status, output_refs, snippet, error, scanner_status = fn()
         finished_at = datetime.now(UTC)
-        status = (
-            LocalActionStatus.SUCCESS
-            if proc.returncode == 0
-            else LocalActionStatus.FAILED
-        )
-        error = None
-        if status == LocalActionStatus.FAILED and proc.stderr.strip():
-            error = LocalActionError(
-                error_code="NONZERO_EXIT",
-                message=proc.stderr.strip()[:500],
-            )
         return LocalActionResult(
-            action_id="",
+            action_id=action_id,
             status=status,
+            input_refs=dict(request.input_refs),
+            output_refs=output_refs,
             started_at=started_at,
             finished_at=finished_at,
             duration_seconds=(finished_at - started_at).total_seconds(),
-            stdout_snippet=proc.stdout.strip()[-500:] if proc.stdout else "",
-            stderr_snippet=proc.stderr.strip()[-500:] if proc.stderr else "",
+            stdout_snippet=snippet[:500] if snippet else "",
+            stderr_snippet=error.message[:500] if error is not None else "",
             error=error,
-            scanner_status="not_applicable",
-        )
-    except subprocess.TimeoutExpired:
-        finished_at = datetime.now(UTC)
-        return LocalActionResult(
-            action_id="",
-            status=LocalActionStatus.ERROR,
-            started_at=started_at,
-            finished_at=finished_at,
-            duration_seconds=(finished_at - started_at).total_seconds(),
-            error=LocalActionError(error_code="TIMEOUT", message="Action timed out"),
-            scanner_status="not_applicable",
+            scanner_status=scanner_status,
         )
     except Exception as exc:
         finished_at = datetime.now(UTC)
+        code = getattr(exc, "code", "EXECUTION_EXCEPTION")
+        if not isinstance(code, str) or not code.strip():
+            code = "EXECUTION_EXCEPTION"
         return LocalActionResult(
-            action_id="",
-            status=LocalActionStatus.ERROR,
+            action_id=action_id,
+            status=LocalActionStatus.FAILED,
+            input_refs=dict(request.input_refs),
             started_at=started_at,
             finished_at=finished_at,
             duration_seconds=(finished_at - started_at).total_seconds(),
-            error=LocalActionError(error_code="EXECUTION_EXCEPTION", message=str(exc)),
+            stderr_snippet=str(exc)[:500],
+            error=LocalActionError(error_code=code, message=str(exc)[:500]),
             scanner_status="not_applicable",
         )
+
+
+def _json_snippet(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True)[:500]
 
 
 def _action_workspace_info(
@@ -88,8 +86,24 @@ def _action_workspace_info(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    result = _cosheaf_cli(["workspace", "info"], repo_root)
-    return result.model_copy(update={"action_id": "workspace.info"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.services import WorkspaceService
+
+        info = WorkspaceService(RepoContext(repo_root)).info()
+        payload = {
+            "name": info.name,
+            "mode": info.mode,
+            "kb_root_count": len(info.kb_roots),
+        }
+        return (
+            LocalActionStatus.SUCCESS,
+            {"workspace_name": info.name, "mode": info.mode},
+            _json_snippet(payload),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("workspace.info", request, _exec)
 
 
 def _action_validate(
@@ -97,8 +111,31 @@ def _action_validate(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    result = _cosheaf_cli(["validate"], repo_root)
-    return result.model_copy(update={"action_id": "validate.run"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.services import ValidationService
+
+        report = ValidationService(RepoContext(repo_root)).validate_repository()
+        if not report.ok:
+            msg = (
+                "; ".join(failure.message for failure in report.failures)
+                or "Validation failed"
+            )
+            return (
+                LocalActionStatus.FAILED,
+                {"checked_files": str(report.checked_count)},
+                msg,
+                LocalActionError(error_code="VALIDATION_FAILED", message=msg[:500]),
+                "not_applicable",
+            )
+        return (
+            LocalActionStatus.SUCCESS,
+            {"checked_files": str(report.checked_count)},
+            f"Validation passed: checked {report.checked_count} YAML record(s).",
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("validate.run", request, _exec)
 
 
 def _action_gate(
@@ -106,8 +143,34 @@ def _action_gate(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    result = _cosheaf_cli(["gate", "run"], repo_root)
-    return result.model_copy(update={"action_id": "gate.run"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.services import GateService
+
+        context = RepoContext(repo_root)
+        result = GateService(context).run()
+        output_refs: dict[str, str] = {}
+        if result.json_path is not None:
+            output_refs["json_report"] = repo_relative_posix(
+                context.repo_root, result.json_path
+            )
+        if result.report.verdict != "pass":
+            msg = f"Gate verdict: {result.report.verdict}"
+            return (
+                LocalActionStatus.FAILED,
+                output_refs,
+                msg,
+                LocalActionError(error_code="GATE_FAILED", message=msg),
+                "not_applicable",
+            )
+        return (
+            LocalActionStatus.SUCCESS,
+            output_refs,
+            f"Gate verdict: {result.report.verdict}",
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("gate.run", request, _exec)
 
 
 def _action_index_rebuild(
@@ -115,8 +178,27 @@ def _action_index_rebuild(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    result = _cosheaf_cli(["index", "rebuild"], repo_root)
-    return result.model_copy(update={"action_id": "index.rebuild"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.storage.index import rebuild_index
+
+        context = RepoContext(repo_root)
+        result = rebuild_index(context)
+        summary = (
+            f"Index rebuilt ({result.artifact_count} artifacts, "
+            f"{result.edge_count} edges)."
+        )
+        return (
+            LocalActionStatus.SUCCESS,
+            {
+                "artifact_count": str(result.artifact_count),
+                "edge_count": str(result.edge_count),
+            },
+            summary,
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("index.rebuild", request, _exec)
 
 
 def _action_memory_search(
@@ -124,9 +206,35 @@ def _action_memory_search(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    query = request.input_refs.get("query", "")
-    result = _cosheaf_cli(["memory", "search", query, "--json"], repo_root)
-    return result.model_copy(update={"action_id": "memory.search"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.services import MemorySearchService
+
+        issue_id = request.input_refs.get("issue_id", "").strip()
+        query = request.input_refs.get("query", "").strip() or issue_id
+        if not query:
+            return (
+                LocalActionStatus.ERROR,
+                {},
+                "",
+                LocalActionError(
+                    error_code="MISSING_QUERY",
+                    message="memory.search requires a non-empty query or issue_id",
+                ),
+                "not_applicable",
+            )
+        result = MemorySearchService(RepoContext(repo_root)).search(
+            query,
+            issue_id=issue_id or None,
+        )
+        return (
+            LocalActionStatus.SUCCESS,
+            {"card_count": str(len(result.cards))},
+            _json_snippet(result.to_dict()),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("memory.search", request, _exec)
 
 
 def _action_context_build(
@@ -134,9 +242,28 @@ def _action_context_build(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    issue_id = request.input_refs.get("issue_id", "")
-    result = _cosheaf_cli(["context", "build", issue_id], repo_root)
-    return result.model_copy(update={"action_id": "context.build"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.services import ContextPackService
+
+        issue_id = request.input_refs.get("issue_id", "").strip()
+        context = RepoContext(repo_root)
+        result = ContextPackService(context).build(
+            issue_id,
+            public_only=policy.mode == "public_only",
+        )
+        return (
+            LocalActionStatus.SUCCESS,
+            {
+                "context_pack": repo_relative_posix(
+                    context.repo_root, result.task_dir
+                )
+            },
+            f"Built context pack for {issue_id}",
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("context.build", request, _exec)
 
 
 def _action_strategy_next(
@@ -144,9 +271,35 @@ def _action_strategy_next(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    issue_id = request.input_refs.get("issue_id", "")
-    result = _cosheaf_cli(["strategy", "next", issue_id, "--json"], repo_root)
-    return result.model_copy(update={"action_id": "strategy.next"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.strategy.models import StrategyError
+        from cosheaf.strategy.planner import build_strategy_plan
+        from cosheaf.strategy.storage import load_strategy_plan
+
+        context = RepoContext(repo_root)
+        plan_or_issue = (
+            request.input_refs.get("strategy_id")
+            or request.input_refs.get("issue_id", "")
+        ).strip()
+        try:
+            loaded = load_strategy_plan(context, plan_or_issue)
+            plan = loaded.plan
+        except StrategyError:
+            built = build_strategy_plan(context, plan_or_issue)
+            plan = built.plan
+        payload = {
+            "plan_id": plan.plan_id,
+            "next_steps": [step.to_dict() for step in plan.next_steps],
+        }
+        return (
+            LocalActionStatus.SUCCESS,
+            {"plan_id": plan.plan_id, "step_count": str(len(plan.next_steps))},
+            _json_snippet(payload),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("strategy.next", request, _exec)
 
 
 def _action_research_loop_scan(
@@ -154,9 +307,35 @@ def _action_research_loop_scan(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    loop_id = request.input_refs.get("loop_id", "")
-    result = _cosheaf_cli(["research-loop", "scan", loop_id, "--json"], repo_root)
-    return result.model_copy(update={"action_id": "research_loop.scan"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.research.loop import scan_research_loop
+
+        loop_id = request.input_refs.get("loop_id", "").strip()
+        result = scan_research_loop(RepoContext(repo_root), loop_id)
+        if result.handoff_blocked:
+            return (
+                LocalActionStatus.BLOCKED,
+                {"report_path": result.report_path},
+                _json_snippet(result.to_dict()),
+                LocalActionError(
+                    error_code="SCANNER_BLOCKED",
+                    message=(
+                        f"research loop {loop_id} has "
+                        f"{result.blocking_finding_count} blocking scan finding(s)"
+                    ),
+                    scanner_blocker=True,
+                ),
+                "blocked",
+            )
+        return (
+            LocalActionStatus.SUCCESS,
+            {"report_path": result.report_path},
+            _json_snippet(result.to_dict()),
+            None,
+            "clean",
+        )
+
+    return _run_typed_service("research_loop.scan", request, _exec)
 
 
 def _action_operator_session_scan(
@@ -164,11 +343,35 @@ def _action_operator_session_scan(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    session_id = request.input_refs.get("session_id", "")
-    result = _cosheaf_cli(
-        ["operator", "session", "scan", session_id, "--json"], repo_root
-    )
-    return result.model_copy(update={"action_id": "operator_session.scan"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.operator_session import scan_operator_session
+
+        session_id = request.input_refs.get("session_id", "").strip()
+        result = scan_operator_session(RepoContext(repo_root), session_id)
+        if result.handoff_blocked:
+            return (
+                LocalActionStatus.BLOCKED,
+                {"report_path": result.report_path.as_posix()},
+                _json_snippet(result.to_dict()),
+                LocalActionError(
+                    error_code="SCANNER_BLOCKED",
+                    message=(
+                        f"operator session {session_id} has "
+                        f"{result.blocking_finding_count} blocking scan finding(s)"
+                    ),
+                    scanner_blocker=True,
+                ),
+                "blocked",
+            )
+        return (
+            LocalActionStatus.SUCCESS,
+            {"report_path": result.report_path.as_posix()},
+            _json_snippet(result.to_dict()),
+            None,
+            "clean",
+        )
+
+    return _run_typed_service("operator_session.scan", request, _exec)
 
 
 def _action_operator_handoff_preview(
@@ -176,20 +379,24 @@ def _action_operator_handoff_preview(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    handoff_id = request.input_refs.get("handoff_id", "")
-    result = _cosheaf_cli(
-        [
-            "operator",
-            "handoff",
-            "export",
-            "--handoff",
-            handoff_id,
-            "--dry-run",
-            "--json",
-        ],
-        repo_root,
-    )
-    return result.model_copy(update={"action_id": "operator_handoff.preview"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.operator_session import export_operator_handoff
+
+        handoff_id = request.input_refs.get("handoff_id", "").strip()
+        result = export_operator_handoff(
+            RepoContext(repo_root),
+            handoff_id=handoff_id,
+            dry_run=True,
+        )
+        return (
+            LocalActionStatus.SUCCESS,
+            {"handoff_bundle": result.target_path},
+            _json_snippet(result.to_dict()),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("operator_handoff.preview", request, _exec)
 
 
 def _action_research_run_summary(
@@ -197,9 +404,20 @@ def _action_research_run_summary(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    run_id = request.input_refs.get("run_id", "")
-    result = _cosheaf_cli(["research-run", "show", run_id, "--json"], repo_root)
-    return result.model_copy(update={"action_id": "research_run.summary"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.research.run import load_research_run
+
+        run_id = request.input_refs.get("run_id", "").strip()
+        result = load_research_run(RepoContext(repo_root), run_id)
+        return (
+            LocalActionStatus.SUCCESS,
+            {"run_id": result.record.run_id, "status": result.record.status.value},
+            _json_snippet(result.to_dict()),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("research_run.summary", request, _exec)
 
 
 def _action_checked_evidence_summary(
@@ -207,11 +425,27 @@ def _action_checked_evidence_summary(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    artifact_id = request.input_refs.get("artifact_id", "")
-    result = _cosheaf_cli(
-        ["checked-evidence", "show", artifact_id, "--json"], repo_root
-    )
-    return result.model_copy(update={"action_id": "checked_evidence.summary"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.verification.counterexample_evidence import (
+            show_checked_counterexample_evidence,
+        )
+
+        evidence_ref = request.input_refs.get("artifact_id", "").strip()
+        result = show_checked_counterexample_evidence(
+            RepoContext(repo_root), evidence_ref
+        )
+        return (
+            LocalActionStatus.SUCCESS,
+            {
+                "evidence_id": result.record.evidence_id,
+                "checked_result": result.record.checked_result.value,
+            },
+            _json_snippet(result.to_dict()),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("checked_evidence.summary", request, _exec)
 
 
 def _action_failure_memory_summary(
@@ -219,9 +453,25 @@ def _action_failure_memory_summary(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    issue_id = request.input_refs.get("issue_id", "")
-    result = _cosheaf_cli(["failure-memory", "show", issue_id, "--json"], repo_root)
-    return result.model_copy(update={"action_id": "failure_memory.summary"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.research.loop import load_attempt_memory_index
+
+        issue_id = request.input_refs.get("issue_id", "").strip()
+        index = load_attempt_memory_index(RepoContext(repo_root))
+        matching = [
+            entry.to_dict()
+            for entry in index.entries
+            if not issue_id or entry.issue_id == issue_id
+        ]
+        return (
+            LocalActionStatus.SUCCESS,
+            {"entry_count": str(len(matching))},
+            _json_snippet({"issue_id": issue_id, "entries": matching}),
+            None,
+            "not_applicable",
+        )
+
+    return _run_typed_service("failure_memory.summary", request, _exec)
 
 
 def _action_eval_research_loop(
@@ -229,8 +479,43 @@ def _action_eval_research_loop(
     policy: LocalActionPolicy,
     repo_root: Path,
 ) -> LocalActionResult:
-    result = _cosheaf_cli(["eval", "research-loop", "--json"], repo_root)
-    return result.model_copy(update={"action_id": "eval.research_loop"})
+    def _exec() -> _ExecReturn:
+        from cosheaf.evals import (
+            DEFAULT_RESEARCH_LOOP_EVAL_CASES,
+            load_research_loop_eval_suite,
+            resolve_research_loop_eval_case_path,
+            run_research_loop_eval_suite,
+        )
+
+        context = RepoContext(repo_root)
+        case_path = resolve_research_loop_eval_case_path(
+            context, DEFAULT_RESEARCH_LOOP_EVAL_CASES
+        )
+        suite = load_research_loop_eval_suite(case_path)
+        report = run_research_loop_eval_suite(context, suite)
+        status = (
+            LocalActionStatus.SUCCESS if report.passed else LocalActionStatus.FAILED
+        )
+        error = (
+            None
+            if report.passed
+            else LocalActionError(
+                error_code="EVAL_FAILED",
+                message="research-loop eval suite did not pass",
+            )
+        )
+        return (
+            status,
+            {
+                "case_count": str(report.case_count),
+                "passed": str(report.passed).lower(),
+            },
+            _json_snippet(report.to_dict()),
+            error,
+            "not_applicable",
+        )
+
+    return _run_typed_service("eval.research_loop", request, _exec)
 
 
 # Action spec definitions for the registry

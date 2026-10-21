@@ -7370,7 +7370,13 @@ def research_loop_run(
             from cosheaf.research.loop_executor import run_local_actions_step
 
             loop = load_loop(ctx, loop_id)
-            result = run_local_actions_step(ctx, loop, dry_run=False)
+            result = run_local_actions_step(
+                ctx,
+                loop,
+                max_attempts=max_attempts,
+                wallclock_minutes=wallclock_minutes,
+                dry_run=False,
+            )
         else:
             result = run_loop(
                 ctx,
@@ -7385,6 +7391,10 @@ def research_loop_run(
             json_output=json_output,
             console=console,
         )
+    has_failure_stop = any(
+        cond.triggered and cond.kind in {"action_failure", "wallclock_exceeded"}
+        for cond in result.stop_conditions
+    )
     if json_output:
         payload = (
             result.to_dict()
@@ -7392,6 +7402,8 @@ def research_loop_run(
             else result.model_dump(mode="json")
         )
         _emit_json(payload)
+        if has_failure_stop:
+            raise typer.Exit(1)
         return
     if execute_local_actions and not dry_run:
         console.print(f"Research loop local run: {result.loop_id}")
@@ -7400,6 +7412,8 @@ def research_loop_run(
     console.print(f"- dry_run: {str(result.dry_run).lower()}")
     console.print(f"- planned_actions: {len(result.planned_actions)}")
     console.print(f"- writes_performed: {str(result.writes_performed).lower()}")
+    if has_failure_stop:
+        raise typer.Exit(1)
 
 
 @research_loop_app.command("export-task")
