@@ -1,0 +1,3 @@
+## 2023-10-21 - Extracting complex components from implicit labels
+**Learning:** Placing complex helper text components (like Markdown hints with dynamic output) inside an implicit `<label>` wrapper makes screen readers announce the entire hint content as part of the primary label whenever the field receives focus. This causes severe verbosity and can confuse users.
+**Action:** Always extract complex hints or descriptions out of the `<label>` and use `aria-describedby` on the input to point to the hint's ID. Use `for` and `id` to associate the `<label>` and the `<input>` or `<textarea>` instead of wrapping them.

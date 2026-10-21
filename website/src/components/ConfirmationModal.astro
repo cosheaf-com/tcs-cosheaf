@@ -45,11 +45,21 @@ const {
         <dd data-modal-required-phrase>{requiredPhrase}</dd>
       </div>
     </dl>
-    <label>
-      <I18nText text={notesLabel} />
-      <textarea name="promotionJustification" rows="4" required></textarea>
-      <MarkdownMathHint />
-    </label>
+    <div style="display: grid; gap: 0.25rem;">
+      <label for="promotion-justification">
+        <I18nText text={notesLabel} />
+      </label>
+      <textarea
+        id="promotion-justification"
+        name="promotionJustification"
+        rows="4"
+        required
+        aria-describedby="markdown-math-hint"
+      ></textarea>
+      <div id="markdown-math-hint">
+        <MarkdownMathHint />
+      </div>
+    </div>
     <div class="preview-toolbar">
       <button class="preview-button secondary" type="button" data-modal-cancel>
         <I18nText text={localized("Cancel", "取消")} />
