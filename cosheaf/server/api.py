@@ -2328,6 +2328,7 @@ class ReadOnlySiteApi:
                 branch=branch or _optional_str(result.get("branch")),
                 base=base or _optional_str(result.get("base")),
                 head=head or _optional_str(result.get("head")),
+                commit_hash=_optional_str(result.get("commit_hash")),
                 preview_only=preview_only,
                 confirm_required=result_status == "confirm_required",
                 confirmed=explicit_confirm,

@@ -550,7 +550,16 @@ def test_b281_forge_push_and_pr_submit_endpoints_return_pr_url(
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         calls.append(args)
-        if args[:2] == ["git", "push"]:
+        if args == ["git", "branch", "--show-current"]:
+            stdout = "feature.web-pr\n"
+        elif args == ["git", "status", "--porcelain=v1"]:
+            stdout = ""
+        elif args in (
+            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "feature.web-pr"],
+        ):
+            stdout = "cafebabe0123456789\n"
+        elif args[:2] == ["git", "push"]:
             stdout = ""
         elif args[:3] == ["gh", "pr", "create"]:
             stdout = "https://github.com/CheemsaDoge/tcs-cosheaf/pull/1004\n"
@@ -593,17 +602,19 @@ def test_b281_forge_push_and_pr_submit_endpoints_return_pr_url(
     assert pr_response.payload["forge_action"]["gate_performed"] is True
     assert pr_response.payload["forge_action"]["push_performed"] is True
     assert pr_response.payload["forge_action"]["github_pr_created"] is True
+    assert pr_response.payload["forge_action"]["commit_hash"] == "cafebabe0123456789"
     assert pr_response.payload["forge_action"]["github_pr_url"].endswith("/pull/1004")
     assert credentials.calls == 1
     assert calls[0] == ["git", "push", "-u", "origin", "feature.web-pr"]
-    assert calls[1] == ["git", "push", "-u", "origin", "feature.web-pr"]
-    assert calls[2][:3] == ["gh", "pr", "create"]
+    assert ["git", "push", "-u", "origin", "feature.web-pr"] in calls[1:]
+    assert calls[-1][:3] == ["gh", "pr", "create"]
 
     entries = _audit_entries(tmp_path)
     assert [entry["action"] for entry in entries] == [
         "forge.push_create",
         "forge.pr_create",
     ]
+    assert entries[1]["commit_hash"] == "cafebabe0123456789"
     assert entries[1]["github_urls"] == [
         "https://github.com/CheemsaDoge/tcs-cosheaf/pull/1004"
     ]

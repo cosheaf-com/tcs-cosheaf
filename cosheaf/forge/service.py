@@ -228,6 +228,10 @@ class ForgeService:
                 "forge pr submit requires --confirm",
             )
         _ensure_unprotected_head(normalized_head)
+        verified_commit_sha = _verify_pr_submit_git_state(
+            self.context,
+            expected_head=normalized_head,
+        )
 
         validation = ValidationService(self.context).validate_repository()
         if not validation.ok:
@@ -242,6 +246,11 @@ class ForgeService:
                 "repository gate failed; fix gate failures before PR submit",
             )
 
+        post_check_sha = _verify_pr_submit_git_state(
+            self.context,
+            expected_head=normalized_head,
+            expected_commit_sha=verified_commit_sha,
+        )
         _run_git(self.context, "push", "-u", normalized_remote, normalized_head)
         title = f"Merge {normalized_head} into {normalized_base}"
         body = f"Forge-created PR for {normalized_head} into {normalized_base}."
@@ -272,6 +281,7 @@ class ForgeService:
             base=normalized_base,
             head=normalized_head,
             branch=normalized_head,
+            commit_hash=post_check_sha,
             validation_performed=True,
             gate_performed=True,
         )
@@ -504,6 +514,47 @@ def _run_git(context: RepoContext, *args: str) -> subprocess.CompletedProcess[st
 def _current_branch(context: RepoContext) -> str:
     branch = _run_git(context, "branch", "--show-current").stdout.strip()
     return _action_non_empty(branch, "branch")
+
+
+def _resolve_commit_sha(context: RepoContext, ref: str) -> str:
+    sha = _run_git(context, "rev-parse", ref).stdout.strip()
+    return _action_non_empty(sha, f"{ref} commit SHA")
+
+
+def _verify_pr_submit_git_state(
+    context: RepoContext,
+    *,
+    expected_head: str,
+    expected_commit_sha: str | None = None,
+) -> str:
+    current_branch = _current_branch(context)
+    if current_branch != expected_head:
+        raise ForgeActionError(
+            "forge_branch_mismatch",
+            f"current branch {current_branch!r} does not match target head "
+            f"{expected_head!r}; switch to {expected_head!r} before PR submit",
+        )
+    status = _git_status(context)
+    if status:
+        raise ForgeActionError(
+            "forge_dirty_state",
+            "dirty working tree blocks PR submission; commit, stash, or clean it first",
+        )
+    head_sha = _resolve_commit_sha(context, "HEAD")
+    target_sha = _resolve_commit_sha(context, expected_head)
+    if head_sha != target_sha:
+        raise ForgeActionError(
+            "forge_head_sha_mismatch",
+            f"HEAD ({head_sha}) does not match target head "
+            f"{expected_head!r} ({target_sha})",
+        )
+    if expected_commit_sha is not None and head_sha != expected_commit_sha:
+        raise ForgeActionError(
+            "forge_head_sha_mismatch",
+            "HEAD commit SHA changed after validation/gate "
+            f"({expected_commit_sha} -> {head_sha})",
+        )
+    return head_sha
 
 
 def _ensure_unprotected_head(branch: str) -> None:

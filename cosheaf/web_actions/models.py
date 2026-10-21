@@ -333,6 +333,7 @@ class WebActionAuditEntry(AgentAccessModel):
     branch: str | None = None
     base: str | None = None
     head: str | None = None
+    commit_hash: str | None = None
     preview_only: bool
     confirm_required: bool = False
     confirmed: bool
@@ -359,7 +360,7 @@ class WebActionAuditEntry(AgentAccessModel):
     def _text(cls, value: str) -> str:
         return _non_empty(value)
 
-    @field_validator("branch", "base", "head")
+    @field_validator("branch", "base", "head", "commit_hash")
     @classmethod
     def _optional_ref(cls, value: str | None) -> str | None:
         if value is None:

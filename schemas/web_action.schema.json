@@ -323,6 +323,18 @@
           "default": null,
           "title": "Head"
         },
+        "commit_hash": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit Hash"
+        },
         "preview_only": {
           "title": "Preview Only",
           "type": "boolean"
