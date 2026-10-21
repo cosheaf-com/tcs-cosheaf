@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -18,6 +18,16 @@ from pydantic import (
 from cosheaf.core.paths import normalize_repo_path
 
 CONFIG_FILENAME = "cosheaf.toml"
+KbVisibility = Literal["public", "private"]
+
+
+def infer_kb_visibility(*values: str) -> KbVisibility:
+    """Infer KB visibility from root name or path segments when not explicit."""
+    for value in values:
+        parts = value.lower().replace("\\", "/").split("/")
+        if any("private" in part for part in parts):
+            return "private"
+    return "public"
 
 
 class WorkspaceConfigError(ValueError):
@@ -33,6 +43,7 @@ class KbRootConfig(BaseModel):
     path: str
     readonly: bool
     priority: int
+    visibility: KbVisibility | None = None
 
     @field_validator("name")
     @classmethod
@@ -53,6 +64,28 @@ class KbRootConfig(BaseModel):
         if ".." in PurePosixPath(normalized).parts:
             raise ValueError("must not contain parent-directory traversal")
         return normalized
+
+    @model_validator(mode="after")
+    def _default_visibility(self) -> Self:
+        if self.visibility is None:
+            object.__setattr__(
+                self,
+                "visibility",
+                infer_kb_visibility(self.name, self.path),
+            )
+        return self
+
+    @property
+    def effective_visibility(self) -> KbVisibility:
+        return self.visibility or infer_kb_visibility(self.name, self.path)
+
+    @property
+    def is_private(self) -> bool:
+        return self.effective_visibility == "private"
+
+    @property
+    def is_public(self) -> bool:
+        return self.effective_visibility == "public"
 
 
 class WorkspacePolicy(BaseModel):

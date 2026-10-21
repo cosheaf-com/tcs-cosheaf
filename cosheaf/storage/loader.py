@@ -18,6 +18,7 @@ from pydantic import (
 )
 from yaml import YAMLError
 
+from cosheaf.config.workspace import KbVisibility, infer_kb_visibility
 from cosheaf.core.artifact import BaseArtifact, validate_revision_hash
 from cosheaf.core.ids import validate_artifact_id
 from cosheaf.core.paths import is_yaml_path, repo_relative_posix
@@ -173,12 +174,48 @@ class LoadedRecord:
     kb_root_path: Path | None = None
     kb_root_readonly: bool = False
     kb_relative_path: Path | None = None
+    kb_root_visibility: KbVisibility | None = None
 
     @property
     def id(self) -> str:
         if isinstance(self.record, AgentTask):
             return self.record.task_id
         return self.record.id
+
+    @property
+    def is_private_scope(self) -> bool:
+        if self.kb_root_visibility == "private":
+            return True
+        if self.kb_root_visibility == "public":
+            return (
+                infer_kb_visibility(
+                    self.kb_root_path.as_posix() if self.kb_root_path else "",
+                    self.source_path.as_posix(),
+                )
+                == "private"
+            )
+        return (
+            infer_kb_visibility(
+                self.kb_root_name or "",
+                self.kb_root_path.as_posix() if self.kb_root_path else "",
+                self.source_path.as_posix(),
+            )
+            == "private"
+        )
+
+    @property
+    def is_public_kb_root(self) -> bool:
+        if self.kb_root_name is None or self.is_private_scope:
+            return False
+        name_lower = self.kb_root_name.lower()
+        if name_lower == "public":
+            return True
+        return self.kb_root_visibility == "public" and name_lower not in {
+            "",
+            "default",
+            "workspace",
+            "framework",
+        }
 
 
 def discover_yaml_paths(context: RepoContext) -> list[Path]:
@@ -230,6 +267,9 @@ def load_yaml_file(context: RepoContext, path: Path) -> LoadedRecord:
         kb_root_path=Path(kb_root.path) if kb_root is not None else None,
         kb_root_readonly=kb_root.readonly if kb_root is not None else False,
         kb_relative_path=kb_relative_path,
+        kb_root_visibility=(
+            kb_root.effective_visibility if kb_root is not None else None
+        ),
     )
 
 

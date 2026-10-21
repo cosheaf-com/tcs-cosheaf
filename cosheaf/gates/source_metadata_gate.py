@@ -112,7 +112,7 @@ def _requires_source_metadata(
     artifact: BaseArtifact,
 ) -> bool:
     return (
-        loaded.kb_root_name == "public"
+        loaded.is_public_kb_root
         and artifact.status is ArtifactStatus.ACCEPTED
     )
 

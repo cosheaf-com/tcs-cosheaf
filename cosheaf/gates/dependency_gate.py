@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
+from cosheaf.config.workspace import WorkspacePolicy
 from cosheaf.core.artifact import BaseArtifact, is_external_dependency_ref
 from cosheaf.core.status import ArtifactStatus, is_preaccepted_status
 from cosheaf.gates.schema_gate import ValidationFailure
@@ -48,8 +49,13 @@ def validate_id_uniqueness(
     return failures
 
 
-def validate_dependencies(records: tuple[LoadedRecord, ...]) -> list[ValidationFailure]:
+def validate_dependencies(
+    records: tuple[LoadedRecord, ...],
+    *,
+    policy: WorkspacePolicy | None = None,
+) -> list[ValidationFailure]:
     """Validate dependency existence and accepted-to-draft dependency rules."""
+    effective_policy = policy or WorkspacePolicy()
     artifact_records = [
         loaded for loaded in records if isinstance(loaded.record, BaseArtifact)
     ]
@@ -80,7 +86,10 @@ def validate_dependencies(records: tuple[LoadedRecord, ...]) -> list[ValidationF
             dependency_record = dependency.record
             if not isinstance(dependency_record, BaseArtifact):
                 continue
-            if _public_depends_on_private(loaded, dependency):
+            if (
+                not effective_policy.public_can_depend_on_private
+                and _public_depends_on_private(loaded, dependency)
+            ):
                 failures.append(
                     ValidationFailure(
                         gate="dependency",
@@ -88,6 +97,21 @@ def validate_dependencies(records: tuple[LoadedRecord, ...]) -> list[ValidationF
                         artifact_id=artifact.id,
                         message=(
                             "public artifact depends on private artifact: "
+                            f"{dependency_id} at {dependency.source_path.as_posix()}"
+                        ),
+                    )
+                )
+            if (
+                not effective_policy.private_can_depend_on_public
+                and _private_depends_on_public(loaded, dependency)
+            ):
+                failures.append(
+                    ValidationFailure(
+                        gate="dependency",
+                        source_path=loaded.source_path.as_posix(),
+                        artifact_id=artifact.id,
+                        message=(
+                            "private artifact depends on public artifact: "
                             f"{dependency_id} at {dependency.source_path.as_posix()}"
                         ),
                     )
@@ -210,7 +234,11 @@ def evaluate_status_transition(
 
 
 def _public_depends_on_private(source: LoadedRecord, dependency: LoadedRecord) -> bool:
-    return source.kb_root_name == "public" and dependency.kb_root_name == "private"
+    return source.is_public_kb_root and dependency.is_private_scope
+
+
+def _private_depends_on_public(source: LoadedRecord, dependency: LoadedRecord) -> bool:
+    return source.is_private_scope and dependency.is_public_kb_root
 
 
 def _record_sort_key(record: LoadedRecord) -> tuple[str, str]:

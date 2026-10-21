@@ -395,8 +395,7 @@ def _private_artifact_ids(context: RepoContext) -> frozenset[str]:
     private_ids = {
         record.id
         for record in records
-        if (record.kb_root_name or "").lower() == "private"
-        or record.source_path.as_posix().startswith("kb/private/")
+        if record.is_private_scope
     }
     return frozenset(private_ids)
 

@@ -484,15 +484,13 @@ def _scopes_for_loaded(
 
 
 def _scope_for_loaded(loaded: LoadedRecord) -> StrategyTaskScope:
-    source = loaded.source_path.as_posix()
-    if "/private/" in source or source.startswith("kb/private/"):
+    if loaded.is_private_scope:
         return StrategyTaskScope.PRIVATE
+    source = loaded.source_path.as_posix()
     if "/public/" in source or source.startswith("kb/public/"):
         return StrategyTaskScope.PUBLIC
-    if loaded.kb_root_name == "public":
+    if loaded.is_public_kb_root:
         return StrategyTaskScope.PUBLIC
-    if loaded.kb_root_name == "private":
-        return StrategyTaskScope.PRIVATE
     if (
         isinstance(loaded.record, BaseArtifact)
         and loaded.record.status is ArtifactStatus.ACCEPTED

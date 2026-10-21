@@ -81,7 +81,9 @@ def validate_repository(context: RepoContext) -> ValidationReport:
     failures: list[ValidationFailure] = list(schema_result.failures)
     failures.extend(validate_id_uniqueness(records))
     failures.extend(validate_status_paths(records))
-    failures.extend(validate_dependencies(records))
+    failures.extend(
+        validate_dependencies(records, policy=context.workspace_config.policy)
+    )
     failures.extend(validate_evidence_paths(context, records))
 
     return ValidationReport(records=records, failures=sort_failures(failures))
@@ -226,7 +228,10 @@ def run_gatekeeper(
         _gate_from_failures(
             gate_id="G4",
             name="dependency gate",
-            failures=validate_dependencies(records),
+            failures=validate_dependencies(
+                records,
+                policy=context.workspace_config.policy,
+            ),
             pass_summary="All loaded artifact dependencies are valid.",
         ),
         _gate_from_failures(

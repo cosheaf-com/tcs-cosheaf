@@ -2138,13 +2138,13 @@ def _artifact_exists_with_private_scope(context: RepoContext, artifact_id: str) 
 
 
 def _loaded_record_scope(record: LoadedRecord) -> MemoryRootScope:
-    root_name = (record.kb_root_name or "").lower()
-    if root_name == "public":
-        return MemoryRootScope.PUBLIC
-    if root_name == "private":
+    if record.is_private_scope:
         return MemoryRootScope.PRIVATE
+    root_name = (record.kb_root_name or "").lower()
     if root_name == "framework":
         return MemoryRootScope.FRAMEWORK
+    if record.is_public_kb_root or root_name == "public":
+        return MemoryRootScope.PUBLIC
     return MemoryRootScope.WORKSPACE
 
 

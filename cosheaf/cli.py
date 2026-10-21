@@ -5726,13 +5726,15 @@ def _workspace_info_to_agent_result(
 
 
 def _kb_root_scope(root: KbRootConfig) -> MemoryRootScope:
-    name = root.name.lower()
-    if name == "public":
-        return MemoryRootScope.PUBLIC
-    if name == "private":
+    if root.is_private:
         return MemoryRootScope.PRIVATE
+    name = root.name.lower()
     if name == "framework":
         return MemoryRootScope.FRAMEWORK
+    if name == "public" or (
+        root.is_public and name not in {"", "default", "workspace"}
+    ):
+        return MemoryRootScope.PUBLIC
     return MemoryRootScope.WORKSPACE
 
 
@@ -6192,7 +6194,7 @@ def _ensure_source_metadata_for_public_promotion(
 ) -> None:
     if not context.workspace_config.policy.accepted_requires_source:
         return
-    if loaded.kb_root_name != "public":
+    if not loaded.is_public_kb_root:
         return
     missing = missing_required_source_metadata(artifact)
     if not missing:
@@ -6396,7 +6398,7 @@ def _default_writable_kb_root(context: RepoContext) -> KbRootConfig:
     if not writable_roots:
         raise ArtifactLifecycleError("no writable KB root is configured")
 
-    private_roots = [root for root in writable_roots if root.name == "private"]
+    private_roots = [root for root in writable_roots if root.is_private]
     candidates = private_roots or writable_roots
     return sorted(
         candidates,

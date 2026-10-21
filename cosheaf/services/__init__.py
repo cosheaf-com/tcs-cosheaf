@@ -2709,7 +2709,7 @@ def _ensure_source_metadata_for_public_promotion(
 ) -> None:
     if not context.workspace_config.policy.accepted_requires_source:
         return
-    if loaded.kb_root_name != "public":
+    if not loaded.is_public_kb_root:
         return
     missing = missing_required_source_metadata(artifact)
     if not missing:
@@ -2791,7 +2791,7 @@ def _strip_legacy_kb_prefix(path: Path) -> Path:
 
 def _default_writable_kb_root(context: RepoContext) -> KbRootConfig:
     for root in context.workspace_config.ordered_kb:
-        if not root.readonly and root.name == "private":
+        if not root.readonly and root.is_private:
             return root
     for root in context.workspace_config.ordered_kb:
         if not root.readonly:

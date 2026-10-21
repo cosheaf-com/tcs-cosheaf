@@ -299,7 +299,7 @@ def _artifact_report(
             source_metadata_required=source_metadata_required,
             missing=missing_source_metadata,
         )
-        + _dependency_reasons(records, loaded, artifact)
+        + _dependency_reasons(context, records, loaded, artifact)
         + _verifier_reasons(
             artifact,
             verifier_results=verifier_results,
@@ -435,7 +435,7 @@ def _readonly_reasons(loaded: LoadedRecord) -> tuple[PromotionReadinessReason, .
 def _source_metadata_required(context: RepoContext, loaded: LoadedRecord) -> bool:
     return (
         context.workspace_config.policy.accepted_requires_source
-        and loaded.kb_root_name == "public"
+        and loaded.is_public_kb_root
     )
 
 
@@ -464,10 +464,12 @@ def _source_metadata_reasons(
 
 
 def _dependency_reasons(
+    context: RepoContext,
     records: tuple[LoadedRecord, ...],
     loaded: LoadedRecord,
     artifact: BaseArtifact,
 ) -> tuple[PromotionReadinessReason, ...]:
+    policy = context.workspace_config.policy
     artifacts_by_id = {
         record.id: record
         for record in records
@@ -488,7 +490,11 @@ def _dependency_reasons(
                 )
             )
             continue
-        if loaded.kb_root_name == "public" and dependency.kb_root_name == "private":
+        if (
+            not policy.public_can_depend_on_private
+            and loaded.is_public_kb_root
+            and dependency.is_private_scope
+        ):
             reasons.append(
                 PromotionReadinessReason(
                     code="private_dependency",
@@ -497,6 +503,23 @@ def _dependency_reasons(
                     source_path=dependency.source_path.as_posix(),
                     message=(
                         "public artifact depends on private artifact: "
+                        f"{dependency_id}"
+                    ),
+                )
+            )
+        if (
+            not policy.private_can_depend_on_public
+            and loaded.is_private_scope
+            and dependency.is_public_kb_root
+        ):
+            reasons.append(
+                PromotionReadinessReason(
+                    code="dependency_risk",
+                    severity="blocking",
+                    artifact_id=artifact.id,
+                    source_path=dependency.source_path.as_posix(),
+                    message=(
+                        "private artifact depends on public artifact: "
                         f"{dependency_id}"
                     ),
                 )

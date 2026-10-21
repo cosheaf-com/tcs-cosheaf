@@ -281,13 +281,13 @@ def _preview_content_mode(
 
 
 def _root_scope_for_loaded_record(loaded: LoadedRecord) -> MemoryRootScope:
-    kb_root_name = (loaded.kb_root_name or "").lower()
-    if kb_root_name == "public":
-        return MemoryRootScope.PUBLIC
-    if kb_root_name == "private":
+    if loaded.is_private_scope:
         return MemoryRootScope.PRIVATE
+    kb_root_name = (loaded.kb_root_name or "").lower()
     if kb_root_name == "framework":
         return MemoryRootScope.FRAMEWORK
+    if loaded.is_public_kb_root or kb_root_name == "public":
+        return MemoryRootScope.PUBLIC
     return MemoryRootScope.WORKSPACE
 
 

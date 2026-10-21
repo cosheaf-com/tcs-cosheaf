@@ -447,11 +447,7 @@ def _authority_boundaries_payload() -> dict[str, Any]:
 
 
 def _is_private_artifact(record: LoadedRecord) -> bool:
-    return isinstance(record.record, BaseArtifact) and _private_text(
-        record.kb_root_name or "",
-        record.kb_root_path.as_posix() if record.kb_root_path else "",
-        record.source_path.as_posix(),
-    )
+    return isinstance(record.record, BaseArtifact) and record.is_private_scope
 
 
 def _is_demo_artifact(record: LoadedRecord) -> bool:
