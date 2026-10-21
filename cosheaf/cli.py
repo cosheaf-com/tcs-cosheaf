@@ -124,6 +124,7 @@ from cosheaf.evals import (
 )
 from cosheaf.forge.cli import forge_app
 from cosheaf.gap_cli import gap_app
+from cosheaf.gates.dependency_gate import evaluate_status_transition
 from cosheaf.gates.gatekeeper import (
     GatekeeperRunResult,
     ValidationReport,
@@ -131,7 +132,10 @@ from cosheaf.gates.gatekeeper import (
     validate_artifact_file,
     validate_repository,
 )
-from cosheaf.gates.promotion_readiness import build_promotion_readiness_report
+from cosheaf.gates.promotion_readiness import (
+    build_promotion_readiness_report,
+    promotion_status_blocker,
+)
 from cosheaf.gates.source_metadata_gate import missing_required_source_metadata
 from cosheaf.graph.claim_graph import DependencyGraph, build_dependency_graph
 from cosheaf.ingest import IngestError, MarkItDownIngestAdapter
@@ -5972,15 +5976,24 @@ def _move_artifact_status(
         return old_status, old_relative_path, new_relative_path
 
     _ensure_repository_valid_for_lifecycle_move(context)
-    _write_status_move(
+    transition_decision = evaluate_status_transition(records, artifact, new_status)
+    if not transition_decision.allowed:
+        raise ArtifactLifecycleError("; ".join(transition_decision.blocking_messages))
+
+    original_text = _write_status_move(
         context=context,
         artifact=artifact,
         source_relative_path=old_relative_path,
         target_relative_path=new_relative_path,
         new_status=new_status,
     )
-    report = validate_artifact_file(context, new_relative_path)
+    report = validate_repository(context)
     if not report.ok:
+        _restore_failed_promotion(
+            source_path=context.resolve(old_relative_path),
+            target_path=context.resolve(new_relative_path),
+            original_text=original_text,
+        )
         raise ArtifactLifecycleError(_format_report_failures(report))
     return old_status, old_relative_path, new_relative_path
 
@@ -6061,7 +6074,11 @@ def _find_unique_promotable_artifact(
 
 
 def _ensure_preaccepted_for_promotion(artifact: BaseArtifact) -> None:
-    if artifact.status is ArtifactStatus.ACCEPTED:
+    blocker = promotion_status_blocker(artifact)
+    if blocker is None:
+        return
+    code, _ = blocker
+    if code == "already_accepted" or artifact.status is ArtifactStatus.ACCEPTED:
         raise ArtifactLifecycleError(f"artifact is already accepted: {artifact.id}")
     if not is_preaccepted_status(artifact.status):
         raise ArtifactLifecycleError(
@@ -6251,7 +6268,7 @@ def _write_status_move(
     source_relative_path: Path,
     target_relative_path: Path,
     new_status: ArtifactStatus,
-) -> None:
+) -> str:
     source_path = context.resolve(source_relative_path)
     target_path = context.resolve(target_relative_path)
     if target_path.exists() and source_path != target_path:
@@ -6263,7 +6280,7 @@ def _write_status_move(
     original_text = source_path.read_text(encoding="utf-8")
     write_yaml_deterministic(source_path, updated)
     if source_path == target_path:
-        return
+        return original_text
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -6271,6 +6288,7 @@ def _write_status_move(
     except OSError:
         source_path.write_text(original_text, encoding="utf-8", newline="\n")
         raise
+    return original_text
 
 
 def _parse_artifact_timestamp(value: str | None) -> datetime:

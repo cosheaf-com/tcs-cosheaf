@@ -59,6 +59,7 @@ from cosheaf.core.status import (
     expected_status_for_path,
     is_preaccepted_status,
 )
+from cosheaf.gates.dependency_gate import evaluate_status_transition
 from cosheaf.gates.gatekeeper import (
     GatekeeperRunResult,
     ValidationReport,
@@ -66,6 +67,7 @@ from cosheaf.gates.gatekeeper import (
     validate_artifact_file,
     validate_repository,
 )
+from cosheaf.gates.promotion_readiness import promotion_status_blocker
 from cosheaf.gates.source_metadata_gate import missing_required_source_metadata
 from cosheaf.memory import (
     ArtifactCard,
@@ -1644,6 +1646,26 @@ class PromotionActionService:
             raise AssertionError("unreachable non-artifact promotion target")
         _ensure_promotion_lifecycle_target(loaded, artifact)
         _ensure_preterminal_for_promotion(artifact)
+        transition_decision = evaluate_status_transition(
+            validation_report.records,
+            artifact,
+            target_status,
+        )
+        if not transition_decision.allowed:
+            raise DraftWriteServiceError(
+                "; ".join(transition_decision.blocking_messages),
+                code="promotion_blocked",
+                remediation=(
+                    "Update or withdraw downstream accepted artifacts before "
+                    "changing this artifact's status."
+                ),
+                details={
+                    "artifact_id": artifact.id,
+                    "impacted_dependents": ", ".join(
+                        transition_decision.impacted_accepted_dependents
+                    ),
+                },
+            )
 
         gatekeeper_result = run_gatekeeper(self.context)
         _ensure_gatekeeper_allows_promotion(gatekeeper_result, artifact.id)
@@ -1744,6 +1766,13 @@ class PromotionActionService:
                     _format_report_failures(report),
                     code="artifact_file_validation_failed",
                     remediation="Fix validation failures before promotion.",
+                )
+            repo_report = validate_repository(self.context)
+            if not repo_report.ok:
+                raise DraftWriteServiceError(
+                    _format_report_failures(repo_report),
+                    code="promotion_validation_failed",
+                    remediation="Fix repository validation failures before promotion.",
                 )
         except Exception:
             if source_path != target_path and target_path.exists():
@@ -2517,7 +2546,11 @@ def _ensure_promotion_path_status_consistent(
 
 
 def _ensure_preterminal_for_promotion(artifact: BaseArtifact) -> None:
-    if artifact.status is ArtifactStatus.ACCEPTED:
+    blocker = promotion_status_blocker(artifact)
+    if blocker is None:
+        return
+    code, _ = blocker
+    if code == "already_accepted" or artifact.status is ArtifactStatus.ACCEPTED:
         raise DraftWriteServiceError(
             f"artifact is already accepted: {artifact.id}",
             code="promotion_blocked",

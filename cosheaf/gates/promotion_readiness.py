@@ -328,39 +328,43 @@ def _artifact_report(
     )
 
 
-def _status_reasons(artifact: BaseArtifact) -> tuple[PromotionReadinessReason, ...]:
+def promotion_status_blocker(artifact: BaseArtifact) -> tuple[str, str] | None:
+    """Shared promotion status policy used by readiness, preview, and execution."""
     if artifact.status in READY_PREACCEPTED_STATUSES:
-        return ()
+        return None
     if artifact.status in DRAFT_STATUSES:
+        if artifact.review.state in PROMOTION_REVIEW_STATES:
+            return None
         return (
-            PromotionReadinessReason(
-                code="draft_status",
-                severity="blocking",
-                artifact_id=artifact.id,
-                status=artifact.status.value,
-                message=(
-                    "artifact is still raw/draft; readiness requires a "
-                    "review-grade pre-accepted status before accepted promotion"
-                ),
+            "draft_status",
+            (
+                "artifact is still raw/draft; readiness requires a "
+                "review-grade pre-accepted status before accepted promotion"
             ),
         )
     if artifact.status is ArtifactStatus.ACCEPTED:
         return (
-            PromotionReadinessReason(
-                code="already_accepted",
-                severity="blocking",
-                artifact_id=artifact.id,
-                status=artifact.status.value,
-                message="artifact is already accepted; no promotion readiness remains",
-            ),
+            "already_accepted",
+            "artifact is already accepted; no promotion readiness remains",
         )
     return (
+        "not_promotable_status",
+        f"artifact status is not promotable: {artifact.status.value}",
+    )
+
+
+def _status_reasons(artifact: BaseArtifact) -> tuple[PromotionReadinessReason, ...]:
+    blocker = promotion_status_blocker(artifact)
+    if blocker is None:
+        return ()
+    code, message = blocker
+    return (
         PromotionReadinessReason(
-            code="not_promotable_status",
+            code=code,
             severity="blocking",
             artifact_id=artifact.id,
             status=artifact.status.value,
-            message=f"artifact status is not promotable: {artifact.status.value}",
+            message=message,
         ),
     )
 
