@@ -379,3 +379,66 @@ def test_web_artifact_accepted_direct_write_is_refused_and_audited(
     assert entries[-1]["action"] == "artifact.create"
     assert entries[-1]["result_status"] == "accepted_write_forbidden"
     assert entries[-1]["repo_writes_performed"] is False
+
+
+def test_web_artifact_write_plan_blocks_post_preview_mutation_and_stale_revision(
+    tmp_path: Path,
+) -> None:
+    _fixture_workspace(tmp_path)
+    api = ReadOnlySiteApi(open_app(tmp_path))
+    payload = {
+        "artifact_type": "claim",
+        "title": "Previewed draft claim",
+        "domain": ["testing"],
+        "status": "draft",
+        "statement": "Previewed statement.",
+        "authors": ["tester"],
+        "tags": ["previewed"],
+        "depends_on": [],
+        "supersedes": [],
+    }
+
+    preview = api.handle(
+        "POST",
+        "/api/artifacts/claim.fixture.artifact-workbench/preview-update",
+        json.dumps(payload),
+    )
+    assert preview.status == 200
+    write_plan = preview.payload["write_plan"]
+    assert write_plan["action"] == "artifact_update"
+    assert write_plan["artifact_id"] == "claim.fixture.artifact-workbench"
+    assert write_plan["request_hash"].startswith("sha256:")
+    assert write_plan["expected_revision"].startswith("sha256:")
+
+    mutated = api.handle(
+        "POST",
+        "/api/artifacts/claim.fixture.artifact-workbench/update",
+        json.dumps(
+            {
+                **payload,
+                "statement": "Mutated after preview without re-previewing.",
+                "confirm": True,
+                "write_plan": write_plan,
+            }
+        ),
+    )
+    assert mutated.status == 400
+    assert mutated.payload["code"] == "write_plan_mismatch"
+
+    stale = api.handle(
+        "POST",
+        "/api/artifacts/claim.fixture.artifact-workbench/update",
+        json.dumps(
+            {
+                **payload,
+                "confirm": True,
+                "write_plan": {
+                    **write_plan,
+                    "expected_revision": "sha256:0000000000000000",
+                },
+            }
+        ),
+    )
+    assert stale.status == 400
+    assert stale.payload["code"] == "stale_artifact_revision"
+

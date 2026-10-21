@@ -48,6 +48,16 @@ export interface ArtifactFormInput {
   supersedes: string;
 }
 
+export interface ArtifactWritePlan {
+  plan_id: string;
+  action: string;
+  artifact_id: string;
+  request_hash: string;
+  expected_revision: string | null;
+  planned_content_revision?: string | null;
+  planned_files?: string[];
+}
+
 export interface ArtifactActionPayload {
   artifact_id: string;
   artifact_type: string;
@@ -60,6 +70,7 @@ export interface ArtifactActionPayload {
   depends_on: string[];
   supersedes: string[];
   confirm?: true;
+  write_plan?: ArtifactWritePlan;
 }
 
 export function parseDelimitedList(value: string): string[] {
@@ -86,7 +97,7 @@ function preacceptedStatus(value: string): string {
 
 export function buildArtifactActionPayload(
   input: ArtifactFormInput,
-  options: { confirm?: true } = {}
+  options: { confirm?: true; writePlan?: ArtifactWritePlan } = {}
 ): ArtifactActionPayload {
   const payload: ArtifactActionPayload = {
     artifact_id: input.artifactId.trim(),
@@ -103,5 +114,52 @@ export function buildArtifactActionPayload(
   if (options.confirm) {
     payload.confirm = true;
   }
+  if (options.writePlan) {
+    payload.write_plan = options.writePlan;
+  }
   return payload;
+}
+
+export function serializeArtifactActionFields(
+  payload: ArtifactActionPayload
+): string {
+  return JSON.stringify({
+    artifact_id: payload.artifact_id,
+    artifact_type: payload.artifact_type,
+    title: payload.title,
+    domain: payload.domain,
+    status: payload.status,
+    statement: payload.statement,
+    authors: payload.authors,
+    tags: payload.tags,
+    depends_on: payload.depends_on,
+    supersedes: payload.supersedes
+  });
+}
+
+export function isPreviewPayloadCurrent(
+  previewed: ArtifactActionPayload | null | undefined,
+  current: ArtifactActionPayload
+): boolean {
+  if (!previewed) {
+    return false;
+  }
+  return (
+    serializeArtifactActionFields(previewed) ===
+    serializeArtifactActionFields(current)
+  );
+}
+
+export function buildConfirmedArtifactActionPayload(
+  previewed: ArtifactActionPayload,
+  writePlan?: ArtifactWritePlan
+): ArtifactActionPayload {
+  const confirmed: ArtifactActionPayload = {
+    ...previewed,
+    confirm: true
+  };
+  if (writePlan) {
+    confirmed.write_plan = writePlan;
+  }
+  return confirmed;
 }

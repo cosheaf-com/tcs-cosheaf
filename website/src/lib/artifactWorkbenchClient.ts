@@ -1,6 +1,10 @@
 import {
   ARTIFACT_ACTION_ENDPOINTS,
-  buildArtifactActionPayload
+  type ArtifactActionPayload,
+  type ArtifactWritePlan,
+  buildArtifactActionPayload,
+  buildConfirmedArtifactActionPayload,
+  isPreviewPayloadCurrent
 } from "./artifactWorkbench";
 
 type ArtifactFormAction = "create" | "update";
@@ -79,16 +83,35 @@ for (const form of document.querySelectorAll<HTMLFormElement>(
     continue;
   }
 
+  let previewedState: {
+    payload: ArtifactActionPayload;
+    writePlan?: ArtifactWritePlan;
+  } | null = null;
+
+  const invalidatePreview = () => {
+    previewedState = null;
+    confirmButton?.setAttribute("disabled", "true");
+  };
+
+  form.addEventListener("input", invalidatePreview);
+  form.addEventListener("change", invalidatePreview);
+
   previewButton?.addEventListener("click", async () => {
     previewButton.disabled = true;
-    confirmButton?.setAttribute("disabled", "true");
+    invalidatePreview();
     try {
-      const payload = artifactPayload(form);
+      const payload = artifactPayload(form, false);
       const preview = await postJson(
         apiBase,
         endpointFor(action, payload.artifact_id, false),
         payload
       );
+      const rawPlan = preview.write_plan;
+      const writePlan =
+        typeof rawPlan === "object" && rawPlan !== null
+          ? (rawPlan as ArtifactWritePlan)
+          : undefined;
+      previewedState = { payload, writePlan };
       setOutput(output, preview);
       confirmButton?.removeAttribute("disabled");
     } catch (error) {
@@ -103,14 +126,30 @@ for (const form of document.querySelectorAll<HTMLFormElement>(
     if (confirmButton?.disabled) {
       return;
     }
+    const currentPayload = artifactPayload(form, false);
+    if (
+      !previewedState ||
+      !isPreviewPayloadCurrent(previewedState.payload, currentPayload)
+    ) {
+      invalidatePreview();
+      setOutput(output, {
+        error:
+          "Preview is out of date; preview changes again before confirming."
+      });
+      return;
+    }
     confirmButton?.setAttribute("disabled", "true");
-    const payload = artifactPayload(form, true);
+    const payload = buildConfirmedArtifactActionPayload(
+      previewedState.payload,
+      previewedState.writePlan
+    );
     try {
       const result = await postJson(
         apiBase,
         endpointFor(action, payload.artifact_id, true),
         payload
       );
+      previewedState = null;
       setOutput(output, result);
       globalThis.location.href =
         redirect ?? `/artifacts/${encodeURIComponent(payload.artifact_id)}/`;

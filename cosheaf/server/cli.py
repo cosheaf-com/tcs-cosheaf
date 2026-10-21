@@ -48,6 +48,14 @@ def server_serve(
             "not authentication or cryptographic identity."
         ),
     ),
+    strict_readonly: bool = typer.Option(
+        False,
+        "--strict-readonly",
+        help=(
+            "Disable all confirmed local/forge write endpoints and allow only "
+            "GET and preview POST requests."
+        ),
+    ),
 ) -> None:
     """Serve local read-only website JSON APIs on localhost."""
     console = Console(width=120, markup=False)
@@ -59,13 +67,30 @@ def server_serve(
     console.print(
         f"Serving read-only website API on http://{READONLY_SERVER_HOST}:{port}"
     )
-    console.print("- writes: disabled")
+    if strict_readonly:
+        console.print(
+            "- writes: disabled (strict read-only; GET and preview POST only)"
+        )
+    else:
+        console.print(
+            "- writes: preview + explicit-confirm workbench actions enabled "
+            "(direct accepted writes forbidden)"
+        )
     local_actor_label = local_actor.strip() if local_actor else "not set"
     console.print(f"- local actor: {local_actor_label}")
     console.print("- authority: display context only")
-    serve_readonly_api(
-        app,
-        host=READONLY_SERVER_HOST,
-        port=port,
-        local_actor=local_actor,
-    )
+    if strict_readonly:
+        serve_readonly_api(
+            app,
+            host=READONLY_SERVER_HOST,
+            port=port,
+            local_actor=local_actor,
+            strict_readonly=True,
+        )
+    else:
+        serve_readonly_api(
+            app,
+            host=READONLY_SERVER_HOST,
+            port=port,
+            local_actor=local_actor,
+        )

@@ -5,6 +5,8 @@ import {
   ARTIFACT_WORKBENCH_LABELS,
   PREACCEPTED_ARTIFACT_STATUSES,
   buildArtifactActionPayload,
+  buildConfirmedArtifactActionPayload,
+  isPreviewPayloadCurrent,
   parseDelimitedList
 } from "../src/lib/artifactWorkbench";
 
@@ -95,5 +97,59 @@ describe("artifact workbench helpers", () => {
     );
 
     expect(payload.confirm).toBe(true);
+  });
+
+  it("binds preview payload and WritePlan to confirm and detects form mutations", () => {
+    const previewed = buildArtifactActionPayload({
+      artifactId: "claim.fixture.web",
+      artifactType: "claim",
+      title: "Web claim",
+      domain: "testing",
+      status: "draft",
+      statement: "Previewed statement.",
+      authors: "tester",
+      tags: "web",
+      dependsOn: "",
+      supersedes: ""
+    });
+    const unchanged = buildArtifactActionPayload({
+      artifactId: "claim.fixture.web",
+      artifactType: "claim",
+      title: "Web claim",
+      domain: "testing",
+      status: "draft",
+      statement: "Previewed statement.",
+      authors: "tester",
+      tags: "web",
+      dependsOn: "",
+      supersedes: ""
+    });
+    const mutated = buildArtifactActionPayload({
+      artifactId: "claim.fixture.web",
+      artifactType: "claim",
+      title: "Web claim",
+      domain: "testing",
+      status: "draft",
+      statement: "Edited after preview.",
+      authors: "tester",
+      tags: "web",
+      dependsOn: "",
+      supersedes: ""
+    });
+
+    expect(isPreviewPayloadCurrent(previewed, unchanged)).toBe(true);
+    expect(isPreviewPayloadCurrent(previewed, mutated)).toBe(false);
+
+    const writePlan = {
+      plan_id: "write-plan.artifact_update.1234",
+      action: "artifact_update",
+      artifact_id: "claim.fixture.web",
+      request_hash: "sha256:abcd",
+      expected_revision: "sha256:0123"
+    };
+    const confirmed = buildConfirmedArtifactActionPayload(previewed, writePlan);
+    expect(confirmed.confirm).toBe(true);
+    expect(confirmed.write_plan).toEqual(writePlan);
+    expect(confirmed.statement).toBe("Previewed statement.");
   });
 });

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -161,6 +162,7 @@ class ReadOnlySiteApi:
         local_actor: str | None = None,
         web_action_mode: WebActionMode = WebActionMode.LOCAL,
         hosted_auth_provider: HostedAuthProvider | None = None,
+        strict_readonly: bool = False,
     ) -> None:
         self.app = app
         self.host = host
@@ -168,6 +170,8 @@ class ReadOnlySiteApi:
         self.local_actor = _normalize_local_actor(local_actor)
         self.web_action_mode = WebActionMode(web_action_mode)
         self.hosted_auth_provider = hosted_auth_provider
+        self.strict_readonly = strict_readonly
+        self._artifact_write_plans: dict[tuple[str, str], dict[str, Any]] = {}
 
     def handle(
         self,
@@ -269,6 +273,23 @@ class ReadOnlySiteApi:
         )
         if blocked is not None:
             return blocked
+        if (
+            self.strict_readonly
+            and not _post_route_is_preview(path, artifact_promotion)
+            and path != "/api/validate/run"
+        ):
+            self._write_audit(
+                action=route_action,
+                result_status="readonly_mode_writes_disabled",
+                explicit_confirm=bool(payload.get("confirm")),
+                preview_only=False,
+                authority_warnings=_authority_warnings_for_action(route_action),
+            )
+            return _error(
+                403,
+                "readonly_mode_writes_disabled",
+                "Confirmed write endpoints are disabled in strict read-only mode.",
+            )
         try:
             if path == "/api/artifacts/preview-create":
                 return self._preview_artifact_create(payload)
@@ -365,10 +386,22 @@ class ReadOnlySiteApi:
         return _error(404, "not_found", f"Unknown endpoint: {path}")
 
     def _health_payload(self) -> dict[str, Any]:
+        confirmed_writes_enabled = not self.strict_readonly
         return {
             "schema_version": READONLY_SERVER_SCHEMA_VERSION,
             "status": "ok",
             "readonly": True,
+            "strict_readonly": self.strict_readonly,
+            "confirmed_writes_enabled": confirmed_writes_enabled,
+            "capabilities": {
+                "read": True,
+                "preview": True,
+                "confirmed_local_writes": confirmed_writes_enabled,
+                "confirmed_forge_actions": (
+                    confirmed_writes_enabled and self.credential_provider is not None
+                ),
+                "direct_accepted_writes": False,
+            },
             "host": self.host,
             "repo_root": str(self.app.context.repo_root),
             "local_actor": self.local_actor,
@@ -402,6 +435,10 @@ class ReadOnlySiteApi:
             {
                 **issue.model_dump(mode="json"),
                 "path": path.as_posix(),
+                "context_pack": _issue_context_pack_summary(
+                    self.app.context.repo_root,
+                    issue.id,
+                ),
             }
             for issue, path in zip(result.issues, result.paths, strict=True)
         ]
@@ -1206,13 +1243,23 @@ class ReadOnlySiteApi:
     def _preview_artifact_create(self, payload: dict[str, Any]) -> ApiResponse:
         action = "artifact_create"
         try:
-            result = self.app.preview_create_artifact(
-                **_artifact_write_args(payload, require_id=True)
-            )
+            write_args = _artifact_write_args(payload, require_id=True)
+            result = self.app.preview_create_artifact(**write_args)
         except DraftWriteServiceError as exc:
             return self._artifact_error(action, exc)
         planned_file = result.relative_path.as_posix()
         yaml_text = result.yaml_text()
+        write_plan = _build_artifact_write_plan(
+            action=action,
+            artifact_id=str(write_args["artifact_id"]),
+            write_args=write_args,
+            expected_revision=None,
+            planned_content_revision=result.artifact.content_revision,
+            planned_files=[planned_file],
+        )
+        self._artifact_write_plans[(action, str(write_args["artifact_id"]))] = (
+            write_plan
+        )
         self._write_audit(
             action=action,
             result_status="preview",
@@ -1228,6 +1275,7 @@ class ReadOnlySiteApi:
             artifact=result.artifact.model_dump(mode="json"),
             path=planned_file,
             yaml=yaml_text,
+            write_plan=write_plan,
             diff=_diff_text(
                 "",
                 yaml_text,
@@ -1248,11 +1296,24 @@ class ReadOnlySiteApi:
         if blocked is not None:
             return blocked
         try:
-            result = self.app.create_artifact(
-                **_artifact_write_args(payload, require_id=True)
-            )
+            write_args = _artifact_write_args(payload, require_id=True)
         except DraftWriteServiceError as exc:
             return self._artifact_error(action, exc)
+        artifact_id = str(write_args["artifact_id"])
+        plan_error = self._verify_artifact_write_plan(
+            action=action,
+            artifact_id=artifact_id,
+            write_args=write_args,
+            current_revision=None,
+            payload=payload,
+        )
+        if plan_error is not None:
+            return plan_error
+        try:
+            result = self.app.create_artifact(**write_args)
+        except DraftWriteServiceError as exc:
+            return self._artifact_error(action, exc)
+        self._artifact_write_plans.pop((action, artifact_id), None)
         planned_file = result.relative_path.as_posix()
         validation = self.app.validate_artifact_file(result.relative_path)
         self._write_audit(
@@ -1289,13 +1350,26 @@ class ReadOnlySiteApi:
         action = "artifact_update"
         try:
             before = _artifact_snapshot(self, artifact_id)
+            write_args = _artifact_write_args(payload, require_id=False)
             result = self.app.preview_update_artifact(
                 artifact_id,
-                **_artifact_write_args(payload, require_id=False),
+                **write_args,
             )
         except DraftWriteServiceError as exc:
             return self._artifact_error(action, exc)
         planned_file = result.relative_path.as_posix()
+        normalized_id = str(before["artifact"].get("id", artifact_id))
+        write_plan = _build_artifact_write_plan(
+            action=action,
+            artifact_id=normalized_id,
+            write_args=write_args,
+            expected_revision=_optional_str(
+                before["artifact"].get("content_revision")
+            ),
+            planned_content_revision=result.artifact.content_revision,
+            planned_files=[planned_file],
+        )
+        self._artifact_write_plans[(action, normalized_id)] = write_plan
         self._write_audit(
             action=action,
             result_status="preview",
@@ -1312,6 +1386,7 @@ class ReadOnlySiteApi:
             artifact=result.artifact.model_dump(mode="json"),
             path=planned_file,
             yaml=result.yaml_text(),
+            write_plan=write_plan,
             diff=_diff_text(
                 before["yaml"],
                 result.yaml_text(),
@@ -1337,12 +1412,29 @@ class ReadOnlySiteApi:
             return blocked
         try:
             before = _artifact_snapshot(self, artifact_id)
+            write_args = _artifact_write_args(payload, require_id=False)
+        except DraftWriteServiceError as exc:
+            return self._artifact_error(action, exc)
+        normalized_id = str(before["artifact"].get("id", artifact_id))
+        plan_error = self._verify_artifact_write_plan(
+            action=action,
+            artifact_id=normalized_id,
+            write_args=write_args,
+            current_revision=_optional_str(
+                before["artifact"].get("content_revision")
+            ),
+            payload=payload,
+        )
+        if plan_error is not None:
+            return plan_error
+        try:
             result = self.app.update_artifact(
                 artifact_id,
-                **_artifact_write_args(payload, require_id=False),
+                **write_args,
             )
         except DraftWriteServiceError as exc:
             return self._artifact_error(action, exc)
+        self._artifact_write_plans.pop((action, normalized_id), None)
         planned_file = result.relative_path.as_posix()
         validation = self.app.validate_artifact_file(result.relative_path)
         self._write_audit(
@@ -1370,6 +1462,67 @@ class ReadOnlySiteApi:
             ),
             validation=_validation_payload(validation),
         )
+
+    def _verify_artifact_write_plan(
+        self,
+        *,
+        action: str,
+        artifact_id: str,
+        write_args: dict[str, Any],
+        current_revision: str | None,
+        payload: dict[str, Any],
+    ) -> ApiResponse | None:
+        raw_plan = payload.get("write_plan")
+        stored_plan = self._artifact_write_plans.get((action, artifact_id))
+        if raw_plan is not None and not isinstance(raw_plan, dict):
+            return _error(
+                400,
+                "invalid_write_plan",
+                "write_plan must be a JSON object when provided.",
+            )
+        candidate_plan = (
+            cast(dict[str, Any], raw_plan)
+            if isinstance(raw_plan, dict)
+            else stored_plan
+        )
+        if candidate_plan is None:
+            return None
+        current_request_hash = _artifact_write_request_hash(
+            action=action,
+            artifact_id=artifact_id,
+            write_args=write_args,
+        )
+        expected_revision = _optional_str(candidate_plan.get("expected_revision"))
+        if expected_revision != current_revision:
+            self._write_audit(
+                action=action,
+                result_status="stale_artifact_revision",
+                explicit_confirm=True,
+                preview_only=False,
+                authority_warnings=[ARTIFACT_WRITE_AUTHORITY_NOTICE],
+            )
+            return _error(
+                400,
+                "stale_artifact_revision",
+                (
+                    "Target artifact revision changed since preview; preview "
+                    "again before confirming."
+                ),
+            )
+        if _optional_str(candidate_plan.get("request_hash")) != current_request_hash:
+            self._write_audit(
+                action=action,
+                result_status="write_plan_mismatch",
+                explicit_confirm=True,
+                preview_only=False,
+                authority_warnings=[ARTIFACT_WRITE_AUTHORITY_NOTICE],
+            )
+            return _error(
+                400,
+                "write_plan_mismatch",
+                "Confirmed artifact payload does not match previewed WritePlan.",
+            )
+        return None
 
     def _preview_artifact_source(
         self,
@@ -2435,9 +2588,15 @@ def serve_readonly_api(
     host: str = READONLY_SERVER_HOST,
     port: int = READONLY_SERVER_PORT,
     local_actor: str | None = None,
+    strict_readonly: bool = False,
 ) -> None:
     """Serve the read-only local website API until interrupted."""
-    api = ReadOnlySiteApi(app, host=host, local_actor=local_actor)
+    api = ReadOnlySiteApi(
+        app,
+        host=host,
+        local_actor=local_actor,
+        strict_readonly=strict_readonly,
+    )
     server = HTTPServer((host, port), make_handler(api))
     try:
         server.serve_forever()
@@ -2787,6 +2946,86 @@ def _artifact_write_args(
     if require_id:
         args["artifact_id"] = _required_text(payload, "artifact_id")
     return args
+
+
+def _artifact_write_request_hash(
+    *,
+    action: str,
+    artifact_id: str,
+    write_args: dict[str, Any],
+) -> str:
+    canonical = {
+        "action": action,
+        "artifact_id": artifact_id,
+        "artifact_type": str(write_args["artifact_type"]),
+        "title": str(write_args["title"]),
+        "domain": list(write_args["domain"]),
+        "status": str(write_args["status"]),
+        "statement": str(write_args["statement"]),
+        "authors": list(write_args["authors"]),
+        "tags": list(write_args["tags"]),
+        "depends_on": list(write_args["depends_on"]),
+        "supersedes": list(write_args["supersedes"]),
+    }
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
+
+
+def _build_artifact_write_plan(
+    *,
+    action: str,
+    artifact_id: str,
+    write_args: dict[str, Any],
+    expected_revision: str | None,
+    planned_content_revision: str | None,
+    planned_files: list[str],
+) -> dict[str, Any]:
+    request_hash = _artifact_write_request_hash(
+        action=action,
+        artifact_id=artifact_id,
+        write_args=write_args,
+    )
+    plan_seed = json.dumps(
+        {
+            "action": action,
+            "artifact_id": artifact_id,
+            "request_hash": request_hash,
+            "expected_revision": expected_revision,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    plan_digest = hashlib.sha256(plan_seed.encode("utf-8")).hexdigest()[:16]
+    return {
+        "plan_id": f"write-plan.{action}.{plan_digest}",
+        "action": action,
+        "artifact_id": artifact_id,
+        "request_hash": request_hash,
+        "expected_revision": expected_revision,
+        "planned_content_revision": planned_content_revision,
+        "planned_files": list(planned_files),
+    }
+
+
+def _issue_context_pack_summary(repo_root: Path, issue_id: str) -> dict[str, Any]:
+    task_dir = repo_root / "context" / "TASKS" / issue_id
+    audit = _read_json_file(task_dir / "RETRIEVAL_AUDIT.json")
+    audit_dict = audit if isinstance(audit, dict) else {}
+    raw_card_count = audit_dict.get("card_count", 0)
+    card_count = (
+        raw_card_count
+        if isinstance(raw_card_count, int) and not isinstance(raw_card_count, bool)
+        else 0
+    )
+    return {
+        "issue_id": issue_id,
+        "exists": task_dir.is_dir(),
+        "card_count": card_count if task_dir.is_dir() else 0,
+        "public_only": bool(audit_dict.get("public_only", False)),
+        "private_context_included": bool(
+            audit_dict.get("private_context_included", False)
+        ),
+    }
 
 
 def _review_decision_planned_files(result: Any) -> list[str]:
@@ -3220,6 +3459,7 @@ def _summary_count(summary: dict[Any, Any], key: str) -> int:
 def _artifact_payload(record: LoadedRecord) -> dict[str, Any]:
     artifact = cast(BaseArtifact, record.record)
     payload = artifact.model_dump(mode="json")
+    payload["content_revision"] = artifact.content_revision
     payload["path"] = record.source_path.as_posix()
     payload["kb_root"] = record.kb_root_name
     payload["kb_root_readonly"] = record.kb_root_readonly
@@ -3240,8 +3480,10 @@ def _artifact_snapshot(api: ReadOnlySiteApi, artifact_id: str) -> dict[str, Any]
     for record in loaded:
         if record.id == normalized_id:
             artifact = cast(BaseArtifact, record.record)
+            artifact_dict = artifact.model_dump(mode="json")
+            artifact_dict["content_revision"] = artifact.content_revision
             return {
-                "artifact": artifact.model_dump(mode="json"),
+                "artifact": artifact_dict,
                 "yaml": dump_yaml_deterministic(artifact),
                 "path": record.source_path.as_posix(),
             }

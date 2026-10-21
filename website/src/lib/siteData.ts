@@ -152,6 +152,8 @@ export interface IssueSummary {
 export interface ContextPackSummary {
   issue_id: string;
   card_count: number;
+  exists?: boolean;
+  source_of_truth?: string;
   public_only: boolean;
   private_context_included: boolean;
   demo_private_context_included: boolean;

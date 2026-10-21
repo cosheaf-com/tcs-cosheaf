@@ -437,8 +437,136 @@ describe("site data contract", () => {
       { source_id: "claim.live", target_id: "definition.live" }
     ]);
     expect(data.context_packs.context_packs[0].issue_id).toBe("issue.live");
+    expect(data.context_packs.context_packs[0].exists).toBe(false);
+    expect(data.context_packs.context_packs[0].card_count).toBe(0);
+    expect(data.reports.source_of_truth).toBe("repository");
+    expect(data.authority_boundaries.source_of_truth).toBe("repository");
     expect(data.gates.verdict).toBe("pass");
     expect(artifactById("claim.live", data)?.title).toBe("Live claim");
+  });
+
+  it("computes live graph diagnostics and preserves missing dependency edges", async () => {
+    const payloads: Record<string, unknown> = {
+      "/api/health": { schema_version: 1, status: "ok" },
+      "/api/workspace/live": {
+        schema_version: 1,
+        kind: "workspace_live",
+        source_of_truth: "repository",
+        authority_notice: "display only",
+        workspace: { name: "live-workspace", mode: "legacy", kb_roots: [] }
+      },
+      "/api/status": {
+        schema_version: 1,
+        kind: "repository_status",
+        source_of_truth: "repository",
+        authority_notice: "display only",
+        status: "validation_failed",
+        validation: { ok: false, checked_count: 2, failures: [{}] }
+      },
+      "/api/artifacts/live": {
+        schema_version: 1,
+        kind: "artifacts_live",
+        source_of_truth: "repository",
+        authority_notice: "display only",
+        count: 2,
+        artifacts: [
+          {
+            id: "theorem.live",
+            type: "theorem",
+            title: "Live accepted theorem",
+            status: "accepted",
+            statement: "Accepted theorem.",
+            domain: ["graph-theory"],
+            tags: [],
+            depends_on: ["lemma.draft", "lemma.missing"],
+            review: { state: "accepted" },
+            risk: { level: "low" },
+            path: "kb/accepted/theorems/theorem.live.yaml"
+          },
+          {
+            id: "lemma.draft",
+            type: "lemma",
+            title: "Live draft lemma",
+            status: "draft",
+            statement: "Draft lemma.",
+            domain: ["graph-theory"],
+            tags: [],
+            depends_on: ["theorem.live"],
+            review: { state: "requested" },
+            risk: { level: "low" },
+            path: "kb/draft/lemmas/lemma.draft.yaml"
+          }
+        ]
+      },
+      "/api/issues/live": {
+        schema_version: 1,
+        kind: "issues_live",
+        source_of_truth: "repository",
+        authority_notice: "display only",
+        count: 1,
+        issues: [
+          {
+            id: "issue.live",
+            type: "issue",
+            title: "Live issue",
+            status: "open",
+            scope: "private",
+            severity: "medium",
+            summary: "Summary.",
+            labels: [],
+            related_artifacts: ["theorem.live", "lemma.draft"],
+            related_sources: [],
+            context_pack: {
+              exists: true,
+              card_count: 5,
+              public_only: true,
+              private_context_included: false
+            }
+          }
+        ]
+      },
+      "/api/gates/latest": {
+        schema_version: 1,
+        kind: "gate_latest",
+        source_of_truth: "repository",
+        authority_notice: "display only",
+        gate_report: { exists: false, verdict: "not_run", report: {} }
+      }
+    };
+    const data = await loadSiteData({
+      env: { dev: true, mode: "live", apiBase: "http://127.0.0.1:8765" },
+      fetcher: async (url: string | URL) =>
+        new Response(JSON.stringify(payloads[new URL(url.toString()).pathname]), {
+          status: 200
+        })
+    });
+
+    expect(data.graph.edges).toEqual([
+      { source_id: "theorem.live", target_id: "lemma.draft" },
+      { source_id: "theorem.live", target_id: "lemma.missing" },
+      { source_id: "lemma.draft", target_id: "theorem.live" }
+    ]);
+    expect(data.graph.missing_dependencies).toEqual([
+      {
+        source_id: "theorem.live",
+        target_id: "lemma.missing",
+        source_path: "kb/accepted/theorems/theorem.live.yaml",
+        message: "missing dependency: lemma.missing"
+      }
+    ]);
+    expect(data.graph.accepted_draft_violations).toEqual([
+      {
+        source_id: "theorem.live",
+        target_id: "lemma.draft",
+        source_path: "kb/accepted/theorems/theorem.live.yaml",
+        message: "accepted artifact depends on draft artifact: lemma.draft"
+      }
+    ]);
+    expect(data.graph.cycles).toEqual([
+      ["lemma.draft", "theorem.live", "lemma.draft"]
+    ]);
+    expect(data.context_packs.context_packs[0].exists).toBe(true);
+    expect(data.context_packs.context_packs[0].card_count).toBe(5);
   });
 
   it("derives a compact workbench dashboard from exported state", async () => {

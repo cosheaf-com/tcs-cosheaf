@@ -1,12 +1,14 @@
 import type {
   ArtifactCard,
   ArtifactsPayload,
+  AuthorityBoundariesPayload,
   ContextPacksPayload,
   GatesPayload,
   GraphPayload,
   IssueSummary,
   IssuesPayload,
   SiteData,
+  SiteExportPayload,
   SitePayload,
   WorkspacePayload
 } from "./siteData";
@@ -101,16 +103,24 @@ function mapLiveSiteData(input: {
   const artifacts = mapArtifacts(input.fixtureData, input.artifacts);
   const issues = mapIssues(input.fixtureData, input.issues);
   const graph = mapGraph(input.fixtureData, artifacts.artifacts);
+  const gates = mapGates(input.fixtureData, input.gates);
   return {
     site: mapSite(input.fixtureData.site),
     workspace: mapWorkspace(input.fixtureData, input.workspace),
     artifacts,
     issues,
     graph,
-    gates: mapGates(input.fixtureData, input.gates),
-    context_packs: mapContextPacks(input.fixtureData, issues.issues),
-    reports: input.fixtureData.reports,
-    authority_boundaries: input.fixtureData.authority_boundaries,
+    gates,
+    context_packs: mapContextPacks(
+      input.fixtureData,
+      issues.issues,
+      input.issues
+    ),
+    reports: mapReports(input.fixtureData, input.status, gates),
+    authority_boundaries: mapAuthorityBoundaries(
+      input.fixtureData,
+      input.health
+    ),
     runtime: runtimeWithHealth(input.runtime, input.health)
   };
 }
@@ -240,36 +250,214 @@ function mapGraph(fixtureData: SiteData, artifacts: ArtifactCard[]): GraphPayloa
     domain: artifact.domain,
     path: artifact.path
   }));
-  const knownIds = new Set(artifacts.map((artifact) => artifact.id));
+  const byId = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
   const edges = artifacts.flatMap((artifact) =>
     artifact.depends_on
-      .filter((target) => !target.startsWith("external:") && knownIds.has(target))
+      .filter((target) => !target.startsWith("external:"))
       .map((target) => ({ source_id: artifact.id, target_id: target }))
+  );
+  const missing_dependencies = artifacts.flatMap((artifact) =>
+    artifact.depends_on
+      .filter((target) => !target.startsWith("external:") && !byId.has(target))
+      .map((target) => ({
+        source_id: artifact.id,
+        target_id: target,
+        source_path: artifact.path,
+        message: `missing dependency: ${target}`
+      }))
+  );
+  const accepted_draft_violations = artifacts
+    .filter((artifact) => artifact.status === "accepted")
+    .flatMap((artifact) =>
+      artifact.depends_on
+        .filter((target) => {
+          if (target.startsWith("external:")) {
+            return false;
+          }
+          const targetArtifact = byId.get(target);
+          return (
+            targetArtifact !== undefined && targetArtifact.status !== "accepted"
+          );
+        })
+        .map((target) => {
+          const targetArtifact = byId.get(target)!;
+          return {
+            source_id: artifact.id,
+            target_id: target,
+            source_path: artifact.path,
+            message: `accepted artifact depends on ${targetArtifact.status} artifact: ${target}`
+          };
+        })
+    );
+  const cycles = detectCycles(
+    edges.filter(
+      (edge) => byId.has(edge.source_id) && byId.has(edge.target_id)
+    ),
+    Array.from(byId.keys())
   );
   return {
     ...fixtureData.graph,
+    source_of_truth: "repository",
     nodes,
     edges,
-    cycles: [],
-    missing_dependencies: [],
-    accepted_draft_violations: []
+    cycles,
+    missing_dependencies,
+    accepted_draft_violations
   };
+}
+
+function detectCycles(
+  edges: Array<{ source_id: string; target_id: string }>,
+  artifactIds: string[]
+): string[][] {
+  const sortedIds = [...artifactIds].sort();
+  const adjacency = new Map<string, string[]>(
+    sortedIds.map((id) => [id, []])
+  );
+  for (const edge of edges) {
+    adjacency.get(edge.source_id)?.push(edge.target_id);
+  }
+  const cycles = new Map<string, string[]>();
+  const stack: string[] = [];
+  const visited = new Set<string>();
+
+  const visit = (artifactId: string): void => {
+    const stackIndex = stack.indexOf(artifactId);
+    if (stackIndex !== -1) {
+      const members = [...stack.slice(stackIndex), artifactId];
+      const canonical = canonicalCycle(members);
+      cycles.set(canonical.join("->"), canonical);
+      return;
+    }
+    if (visited.has(artifactId)) {
+      return;
+    }
+    stack.push(artifactId);
+    const targets = [...(adjacency.get(artifactId) ?? [])].sort();
+    for (const target of targets) {
+      visit(target);
+    }
+    stack.pop();
+    visited.add(artifactId);
+  };
+
+  for (const id of sortedIds) {
+    visit(id);
+  }
+  return Array.from(cycles.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, cycle]) => cycle);
+}
+
+function canonicalCycle(cycle: string[]): string[] {
+  const members = cycle.slice(0, -1);
+  if (members.length === 0) {
+    return cycle;
+  }
+  let best = [...members, members[0]];
+  let bestKey = best.join("\u0000");
+  for (let index = 1; index < members.length; index += 1) {
+    const rotated = [
+      ...members.slice(index),
+      ...members.slice(0, index),
+      members[index]
+    ];
+    const key = rotated.join("\u0000");
+    if (key < bestKey) {
+      best = rotated;
+      bestKey = key;
+    }
+  }
+  return best;
 }
 
 function mapContextPacks(
   fixtureData: SiteData,
-  issues: IssueSummary[]
+  issues: IssueSummary[],
+  issuesPayload?: Record<string, unknown>
 ): ContextPacksPayload {
+  const rawById = new Map<string, Record<string, unknown>>();
+  for (const rawIssue of arrayOfRecords(issuesPayload?.issues)) {
+    const id = text(rawIssue.id, "");
+    if (id) {
+      rawById.set(id, asRecord(rawIssue.context_pack));
+    }
+  }
   return {
     ...fixtureData.context_packs,
-    context_packs: issues.map((issue) => ({
-      issue_id: issue.id,
-      card_count: issue.related_artifacts.length,
-      public_only: false,
-      private_context_included: false,
-      demo_private_context_included: false,
-      related_artifacts: issue.related_artifacts
-    }))
+    source_of_truth: "repository",
+    context_packs: issues.map((issue) => {
+      const rawPack = rawById.get(issue.id) ?? {};
+      const exists = Boolean(rawPack.exists);
+      return {
+        issue_id: issue.id,
+        exists,
+        source_of_truth: "repository",
+        card_count: exists ? numberValue(rawPack.card_count, 0) : 0,
+        public_only: Boolean(rawPack.public_only),
+        private_context_included: Boolean(rawPack.private_context_included),
+        demo_private_context_included: false,
+        related_artifacts: issue.related_artifacts
+      };
+    })
+  };
+}
+
+function mapReports(
+  fixtureData: SiteData,
+  statusPayload: Record<string, unknown>,
+  gates: GatesPayload
+): SiteExportPayload {
+  const validation = asRecord(statusPayload.validation);
+  const reports: Array<Record<string, unknown>> = [
+    {
+      kind: "repository_validation",
+      source_of_truth: "repository",
+      ok: Boolean(validation.ok),
+      checked_count: numberValue(validation.checked_count, 0),
+      failure_count: arrayValue(validation.failures).length
+    }
+  ];
+  for (const reportPath of gates.report_paths) {
+    reports.push({
+      kind: "gate_report",
+      source_of_truth: "repository",
+      path: reportPath,
+      verdict: gates.verdict
+    });
+  }
+  return {
+    ...fixtureData.reports,
+    authority_notice: authorityNotice(statusPayload, fixtureData.reports),
+    source_of_truth: "repository",
+    demo: false,
+    note:
+      gates.report_paths.length > 0
+        ? `Live repository validation and ${gates.report_paths.length} gate report(s) loaded.`
+        : "Live repository validation loaded; no gate report file exists yet.",
+    reports
+  };
+}
+
+function mapAuthorityBoundaries(
+  fixtureData: SiteData,
+  healthPayload: Record<string, unknown>
+): AuthorityBoundariesPayload {
+  return {
+    ...fixtureData.authority_boundaries,
+    authority_notice: authorityNotice(
+      healthPayload,
+      fixtureData.authority_boundaries
+    ),
+    source_of_truth: "repository",
+    website_is_authority: false,
+    export_is_source_of_truth: false,
+    frontend_credentials_allowed: false,
+    skipped_is_pass: false,
+    gate_pass_is_truth: false,
+    verifier_pass_is_truth: false,
+    ai_output_is_human_review: false,
+    accepted_write_performed: false
   };
 }
 

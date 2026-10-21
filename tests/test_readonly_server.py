@@ -1109,3 +1109,44 @@ def test_server_cli_requires_readonly_guard(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "pass --readonly" in result.output
+
+
+def test_health_capabilities_and_strict_readonly_refuses_confirmed_writes(
+    tmp_path: Path,
+) -> None:
+    _fixture_workspace(tmp_path)
+    default_api = ReadOnlySiteApi(open_app(tmp_path))
+    default_health = default_api.handle("GET", "/api/health")
+    assert default_health.status == 200
+    assert default_health.payload["strict_readonly"] is False
+    assert default_health.payload["confirmed_writes_enabled"] is True
+    assert default_health.payload["capabilities"]["confirmed_local_writes"] is True
+
+    strict_api = ReadOnlySiteApi(open_app(tmp_path), strict_readonly=True)
+    strict_health = strict_api.handle("GET", "/api/health")
+    assert strict_health.status == 200
+    assert strict_health.payload["strict_readonly"] is True
+    assert strict_health.payload["confirmed_writes_enabled"] is False
+    assert strict_health.payload["capabilities"]["confirmed_local_writes"] is False
+
+    preview = strict_api.handle(
+        "POST",
+        "/api/context/issue.fixture.readonly-server/preview-build",
+        json.dumps({"role": "orchestrator", "public_only": True}),
+    )
+    assert preview.status == 200
+
+    blocked_write = strict_api.handle(
+        "POST",
+        "/api/context/issue.fixture.readonly-server/build",
+        json.dumps(
+            {
+                "role": "orchestrator",
+                "public_only": True,
+                "confirm": True,
+            }
+        ),
+    )
+    assert blocked_write.status == 403
+    assert blocked_write.payload["code"] == "readonly_mode_writes_disabled"
+
