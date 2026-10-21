@@ -611,3 +611,53 @@ def test_gateway_logs_malformed_worker_bundle_retry_failure(
 def test_gateway_request_rejects_accepted_output_paths() -> None:
     with pytest.raises(ValidationError, match="accepted knowledge"):
         _request(expected_output_paths=["kb/accepted/claims/provider.yaml"])
+
+
+def test_consecutive_provider_calls_preserve_distinct_run_logs(tmp_path: Path) -> None:
+    context = RepoContext(tmp_path)
+    first = ProviderGateway(context).call(_request(prompt="First distinct prompt."))
+    second = ProviderGateway(context).call(_request(prompt="Second distinct prompt."))
+    third = ProviderGateway(context).call(_request(prompt="First distinct prompt."))
+
+    assert isinstance(first, ModelCallResult)
+    assert isinstance(second, ModelCallResult)
+    assert isinstance(third, ModelCallResult)
+    assert first.provider_run.run_id == "run.provider.0001"
+    assert second.provider_run.run_id == "run.provider.0002"
+    assert third.provider_run.run_id == "run.provider.0003"
+    assert first.request_id == "request.provider.0001"
+    assert second.request_id == "request.provider.0002"
+    assert third.request_id == "request.provider.0003"
+    assert (
+        first.provider_run.request_fingerprint
+        != second.provider_run.request_fingerprint
+    )
+    assert (
+        first.provider_run.request_fingerprint
+        == third.provider_run.request_fingerprint
+    )
+
+    first_log = _read_provider_log(tmp_path, first)
+    second_log = _read_provider_log(tmp_path, second)
+    assert first_log["run_id"] == "run.provider.0001"
+    assert second_log["run_id"] == "run.provider.0002"
+    assert first_log["request_fingerprint"] == first.provider_run.request_fingerprint
+    assert second_log["request_fingerprint"] == second.provider_run.request_fingerprint
+
+
+def test_provider_gateway_supports_injected_id_generator_and_refuses_overwrite(
+    tmp_path: Path,
+) -> None:
+    context = RepoContext(tmp_path)
+    gateway = ProviderGateway(
+        context,
+        id_generator=lambda: ("run.provider.custom", "request.provider.custom"),
+    )
+
+    first = gateway.call(_request(prompt="Deterministic custom ID call."))
+    assert isinstance(first, ModelCallResult)
+    assert first.provider_run.run_id == "run.provider.custom"
+    assert first.request_id == "request.provider.custom"
+
+    with pytest.raises(ValueError, match="already exists and cannot be overwritten"):
+        gateway.call(_request(prompt="Duplicate ID call must not overwrite log."))

@@ -430,11 +430,37 @@ class OpenAICompatibleHttpTransport:
         )
 
 
+ProviderIdGenerator = Callable[[], tuple[str, str]]
+
+
+def _allocate_provider_ids(context: RepoContext) -> tuple[str, str]:
+    providers_dir = context.resolve(Path(".cosheaf") / "providers")
+    max_index = 0
+    if providers_dir.exists():
+        for existing in providers_dir.glob("run.provider.*.json"):
+            suffix = existing.stem.removeprefix("run.provider.")
+            if suffix.isdigit():
+                max_index = max(max_index, int(suffix))
+    index = max_index + 1
+    while (providers_dir / f"run.provider.{index:04d}.json").exists():
+        index += 1
+    return (
+        validate_artifact_id(f"run.provider.{index:04d}"),
+        validate_artifact_id(f"request.provider.{index:04d}"),
+    )
+
+
 class ProviderGateway:
     """Provider gateway service with fake and injected OpenAI-compatible modes."""
 
-    def __init__(self, context: RepoContext) -> None:
+    def __init__(
+        self,
+        context: RepoContext,
+        *,
+        id_generator: ProviderIdGenerator | None = None,
+    ) -> None:
         self.context = context
+        self._id_generator = id_generator
 
     def call(
         self,
@@ -450,13 +476,19 @@ class ProviderGateway:
             model=request.model,
             enabled=True,
         )
-        run_id = "run.provider.0001"
+        if self._id_generator is not None:
+            raw_run_id, raw_request_id = self._id_generator()
+            run_id = validate_artifact_id(raw_run_id)
+            request_id = validate_artifact_id(raw_request_id)
+        else:
+            run_id, request_id = _allocate_provider_ids(self.context)
         started_at = _now()
         if normalized_config.mode is ProviderMode.FAKE:
             return self._call_fake(
                 request,
                 config=normalized_config,
                 run_id=run_id,
+                request_id=request_id,
                 started_at=started_at,
             )
         return self._call_openai_compatible(
@@ -464,6 +496,7 @@ class ProviderGateway:
             config=normalized_config,
             provider=provider,
             run_id=run_id,
+            request_id=request_id,
             started_at=started_at,
         )
 
@@ -473,6 +506,7 @@ class ProviderGateway:
         *,
         config: ProviderConfig,
         run_id: str,
+        request_id: str,
         started_at: datetime,
     ) -> ModelCallResult:
         fake = FakeModelProvider()
@@ -482,6 +516,7 @@ class ProviderGateway:
             request,
             config=config,
             run_id=run_id,
+            request_id=request_id,
             started_at=started_at,
             content=content,
             finish_reason=response.finish_reason,
@@ -497,6 +532,7 @@ class ProviderGateway:
         config: ProviderConfig,
         provider: OpenAICompatibleProvider | None,
         run_id: str,
+        request_id: str,
         started_at: datetime,
     ) -> ModelCallResult | ProviderError:
         if not config.enabled:
@@ -625,6 +661,7 @@ class ProviderGateway:
             request,
             config=config,
             run_id=run_id,
+            request_id=request_id,
             started_at=started_at,
             content=content,
             finish_reason=transport_result.finish_reason,
@@ -697,6 +734,7 @@ class ProviderGateway:
         *,
         config: ProviderConfig,
         run_id: str,
+        request_id: str,
         started_at: datetime,
         content: str,
         finish_reason: FinishReason,
@@ -720,7 +758,7 @@ class ProviderGateway:
             log_path=normalize_repo_path(log_path),
         )
         result = ModelCallResult(
-            request_id="request.provider.0001",
+            request_id=request_id,
             provider=request.provider,
             model=request.model,
             status=ProviderRunStatus.COMPLETED,
@@ -1135,10 +1173,16 @@ def _write_provider_log(
     metadata: Mapping[str, str],
 ) -> None:
     path = context.resolve(relative_path)
+    if path.exists():
+        raise ValueError(
+            "provider run log already exists and cannot be overwritten: "
+            f"{relative_path.as_posix()}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     log = {
         "schema_version": 1,
         "run_id": provider_run.run_id,
+        "request_id": result.request_id,
         "provider": request.provider.value,
         "mode": config.mode.value,
         "model": request.model,
@@ -1199,6 +1243,11 @@ def _write_provider_error_log(
     metadata: Mapping[str, str],
 ) -> None:
     path = context.resolve(relative_path)
+    if path.exists():
+        raise ValueError(
+            "provider run log already exists and cannot be overwritten: "
+            f"{relative_path.as_posix()}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     log = {
         "schema_version": 1,

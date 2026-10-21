@@ -21,12 +21,15 @@ from cosheaf.storage.repo import RepoContext
 from cosheaf.workflow.engine import (
     WORKFLOW_AUTHORITY_NOTICE,
     ReadinessClass,
+    WorkflowError,
     WorkflowStep,
     assess_readiness,
     load_workflow,
     start_workflow,
     step_workflow,
+    update_workflow,
     workflow_events_path,
+    workflow_librarian_path,
     workflow_path,
 )
 from cosheaf.workflow.proposal import (
@@ -535,3 +538,90 @@ def test_draft_proposal_rejects_candidate_authority_overclaim() -> None:
         assert "draft" in str(exc).lower()
     else:
         raise AssertionError("accepted candidate status must be rejected")
+
+
+def test_start_workflow_rejects_duplicate_id_and_preserves_existing_records(
+    tmp_path: Path,
+) -> None:
+    context = RepoContext(tmp_path)
+    start_workflow(
+        context,
+        issue_id="issue.workflow.first",
+        query="first query",
+        workflow_id="workflow.shared",
+    )
+    step_workflow(
+        context,
+        "workflow.shared",
+        action_id="workspace.info",
+        execute_local_action=False,
+    )
+
+    try:
+        start_workflow(
+            context,
+            issue_id="issue.workflow.second",
+            query="second query",
+            workflow_id="workflow.shared",
+        )
+    except WorkflowError as exc:
+        assert exc.code == "WORKFLOW_ALREADY_EXISTS"
+    else:
+        raise AssertionError("duplicate start_workflow must be rejected")
+
+    loaded = load_workflow(context, "workflow.shared")
+    assert loaded.issue_id == "issue.workflow.first"
+    assert loaded.query == "first query"
+    assert len(loaded.steps) == 1
+    librarian = json.loads(
+        (tmp_path / workflow_librarian_path("workflow.shared")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert librarian["issue_id"] == "issue.workflow.first"
+
+
+def test_update_workflow_enforces_revision_and_append_only_history(
+    tmp_path: Path,
+) -> None:
+    context = RepoContext(tmp_path)
+    start_workflow(
+        context,
+        issue_id="issue.workflow.first",
+        workflow_id="workflow.rev",
+    )
+    stale = load_workflow(context, "workflow.rev")
+    assert stale.revision == 1
+
+    step_workflow(
+        context,
+        "workflow.rev",
+        action_id="workspace.info",
+        execute_local_action=False,
+    )
+    current = load_workflow(context, "workflow.rev")
+    assert current.revision == 2
+
+    try:
+        update_workflow(context, stale, expected_revision=1)
+    except WorkflowError as exc:
+        assert exc.code == "WORKFLOW_REVISION_CONFLICT"
+    else:
+        raise AssertionError("stale revision update must be rejected")
+
+    try:
+        update_workflow(context, current.model_copy(update={"steps": []}))
+    except WorkflowError as exc:
+        assert exc.code == "WORKFLOW_HISTORY_CONFLICT"
+    else:
+        raise AssertionError("truncating workflow steps must be rejected")
+
+    try:
+        update_workflow(
+            context,
+            current.model_copy(update={"issue_id": "issue.workflow.other"}),
+        )
+    except WorkflowError as exc:
+        assert exc.code == "WORKFLOW_CONFLICT"
+    else:
+        raise AssertionError("changing workflow issue_id must be rejected")

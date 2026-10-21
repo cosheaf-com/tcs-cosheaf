@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -86,10 +87,24 @@ def _safe_id(value: str, *, field_name: str) -> str:
         ) from exc
 
 
-def _default_workflow_id(issue_id: str) -> str:
+def _default_workflow_id(
+    issue_id: str,
+    *,
+    context: RepoContext | None = None,
+) -> str:
     issue = _safe_id(issue_id, field_name="issue_id")
     stamp = _utc_now().strftime("%Y%m%d%H%M%S")
-    return validate_artifact_id(f"workflow.{issue}.{stamp}")
+    base_id = validate_artifact_id(f"workflow.{issue}.{stamp}")
+    if context is None:
+        return base_id
+    if not context.resolve(workflow_root(base_id)).exists():
+        return base_id
+    seq = 2
+    while True:
+        candidate = validate_artifact_id(f"{base_id}.{seq:04d}")
+        if not context.resolve(workflow_root(candidate)).exists():
+            return candidate
+        seq += 1
 
 
 def _has_accepted_path(value: object) -> bool:
@@ -239,6 +254,7 @@ class WorkflowRecord(WorkflowModel):
     workflow_id: str
     issue_id: str = ""
     query: str = ""
+    revision: int = Field(default=1, ge=1)
     status: WorkflowStatus = WorkflowStatus.CREATED
     steps: list[WorkflowStep] = Field(default_factory=list)
     readiness: ReadinessClass | None = None
@@ -411,7 +427,7 @@ def _ensure_component_files(context: RepoContext, workflow: WorkflowRecord) -> N
             _write_json(context, relative_path, payload)
 
 
-def write_workflow(
+def _persist_workflow_files(
     context: RepoContext,
     workflow: WorkflowRecord,
 ) -> WorkflowWriteResult:
@@ -435,6 +451,98 @@ def write_workflow(
         loop_path=workflow_loop_path(workflow.workflow_id),
         readiness_path=workflow_readiness_path(workflow.workflow_id),
     )
+
+
+def create_workflow(
+    context: RepoContext,
+    workflow: WorkflowRecord,
+) -> WorkflowWriteResult:
+    candidates = (
+        workflow_path(workflow.workflow_id),
+        workflow_events_path(workflow.workflow_id),
+        workflow_librarian_path(workflow.workflow_id),
+        workflow_fsm_path(workflow.workflow_id),
+        workflow_loop_path(workflow.workflow_id),
+        workflow_readiness_path(workflow.workflow_id),
+    )
+    for rel in candidates:
+        target = context.resolve(rel)
+        _ensure_repo_local(context, target)
+        if target.exists():
+            raise WorkflowError(
+                f"workflow already exists: {workflow.workflow_id}",
+                code="WORKFLOW_ALREADY_EXISTS",
+                remediation=(
+                    "Use a unique workflow ID or run `cosheaf workflow step` / "
+                    "`cosheaf workflow run` on the existing workflow."
+                ),
+                details={"workflow_id": workflow.workflow_id},
+            )
+    return _persist_workflow_files(context, workflow)
+
+
+def update_workflow(
+    context: RepoContext,
+    workflow: WorkflowRecord,
+    *,
+    expected_revision: int | None = None,
+) -> WorkflowWriteResult:
+    existing = load_workflow(context, workflow.workflow_id)
+    if expected_revision is not None and existing.revision != expected_revision:
+        raise WorkflowError(
+            f"workflow revision conflict for {workflow.workflow_id}: "
+            f"expected {expected_revision}, found {existing.revision}",
+            code="WORKFLOW_REVISION_CONFLICT",
+            remediation="Reload the workflow record before applying updates.",
+            details={
+                "workflow_id": workflow.workflow_id,
+                "expected_revision": str(expected_revision),
+                "current_revision": str(existing.revision),
+            },
+        )
+    if (
+        existing.issue_id
+        and workflow.issue_id
+        and existing.issue_id != workflow.issue_id
+    ):
+        raise WorkflowError(
+            f"workflow {workflow.workflow_id} cannot change issue_id "
+            f"from {existing.issue_id!r} to {workflow.issue_id!r}",
+            code="WORKFLOW_CONFLICT",
+            remediation="Start a new workflow with a distinct workflow ID.",
+            details={"workflow_id": workflow.workflow_id},
+        )
+    if (
+        len(workflow.steps) < len(existing.steps)
+        or workflow.steps[: len(existing.steps)] != existing.steps
+    ):
+        raise WorkflowError(
+            f"workflow {workflow.workflow_id} step history is append-only and "
+            "cannot be truncated or rewritten",
+            code="WORKFLOW_HISTORY_CONFLICT",
+            remediation="Append new steps to the existing workflow history.",
+            details={"workflow_id": workflow.workflow_id},
+        )
+    next_revision = max(workflow.revision, existing.revision + 1)
+    updated = workflow.model_copy(update={"revision": next_revision})
+    return _persist_workflow_files(context, updated)
+
+
+def write_workflow(
+    context: RepoContext,
+    workflow: WorkflowRecord,
+    *,
+    expected_revision: int | None = None,
+) -> WorkflowWriteResult:
+    target = context.resolve(workflow_path(workflow.workflow_id))
+    _ensure_repo_local(context, target)
+    if target.exists():
+        return update_workflow(
+            context,
+            workflow,
+            expected_revision=expected_revision,
+        )
+    return create_workflow(context, workflow)
 
 
 def load_workflow(context: RepoContext, workflow_id: str) -> WorkflowRecord:
@@ -490,13 +598,15 @@ def start_workflow(
     issue_id: str,
     query: str = "",
     workflow_id: str | None = None,
+    id_generator: Callable[[], str] | None = None,
 ) -> WorkflowWriteResult:
     now = _utc_now()
-    resolved_workflow_id = (
-        _safe_id(workflow_id, field_name="workflow_id")
-        if workflow_id is not None
-        else _default_workflow_id(issue_id)
-    )
+    if workflow_id is not None:
+        resolved_workflow_id = _safe_id(workflow_id, field_name="workflow_id")
+    elif id_generator is not None:
+        resolved_workflow_id = _safe_id(id_generator(), field_name="workflow_id")
+    else:
+        resolved_workflow_id = _default_workflow_id(issue_id, context=context)
     workflow_input = WorkflowInput(issue_id=issue_id, query=query)
     workflow = WorkflowRecord(
         workflow_id=resolved_workflow_id,
@@ -506,7 +616,7 @@ def start_workflow(
         updated_at=now,
         input=workflow_input,
     )
-    result = write_workflow(context, workflow)
+    result = create_workflow(context, workflow)
     append_workflow_event(
         context,
         workflow_id=workflow.workflow_id,
@@ -530,6 +640,7 @@ def append_step(record: WorkflowRecord, step: WorkflowStep) -> WorkflowRecord:
             "steps": steps,
             "status": status,
             "updated_at": _utc_now(),
+            "revision": record.revision + 1,
         }
     )
 
@@ -624,7 +735,7 @@ def step_workflow(
     updated = append_step(workflow, step)
     readiness = assess_readiness(updated)
     updated = updated.model_copy(update={"readiness": readiness.classification})
-    write_workflow(context, updated)
+    update_workflow(context, updated, expected_revision=workflow.revision)
     events_path = append_workflow_event(
         context,
         workflow_id=updated.workflow_id,
@@ -753,10 +864,12 @@ __all__ = [
     "append_step",
     "append_workflow_event",
     "assess_readiness",
+    "create_workflow",
     "load_workflow",
     "run_workflow",
     "start_workflow",
     "step_workflow",
+    "update_workflow",
     "workflow_events_path",
     "workflow_fsm_path",
     "workflow_librarian_path",
