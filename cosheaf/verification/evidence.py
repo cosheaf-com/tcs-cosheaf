@@ -64,6 +64,7 @@ class VerifierEvidenceRecord(BaseModel):
     created_at: datetime
     checker_input_hash: str | None = None
     checker_output_hash: str | None = None
+    target_revision: str | None = None
     limitations: tuple[str, ...]
 
     @classmethod
@@ -77,6 +78,7 @@ class VerifierEvidenceRecord(BaseModel):
         limitations: tuple[str, ...] | list[str] | None = None,
         checker_input_hash: str | None = None,
         checker_output_hash: str | None = None,
+        target_revision: str | None = None,
         log_path: str | None = None,
     ) -> VerifierEvidenceRecord:
         """Create a v1 evidence record from an existing runtime result."""
@@ -103,6 +105,7 @@ class VerifierEvidenceRecord(BaseModel):
             created_at=result.ended_at,
             checker_input_hash=checker_input_hash,
             checker_output_hash=checker_output_hash,
+            target_revision=target_revision,
             limitations=normalized_limitations,
         )
 
@@ -173,7 +176,7 @@ class VerifierEvidenceRecord(BaseModel):
             raise ValueError("created_at must include timezone information")
         return value
 
-    @field_validator("checker_input_hash", "checker_output_hash")
+    @field_validator("checker_input_hash", "checker_output_hash", "target_revision")
     @classmethod
     def _sha256(cls, value: str | None) -> str | None:
         if value is None:
@@ -226,7 +229,10 @@ class VerifierEvidenceRecord(BaseModel):
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic JSON-serializable mapping."""
-        return self.model_dump(mode="json")
+        dumped = self.model_dump(mode="json")
+        if dumped.get("target_revision") is None:
+            dumped.pop("target_revision", None)
+        return dumped
 
     def to_json(self) -> str:
         """Return deterministic JSON for this evidence record."""

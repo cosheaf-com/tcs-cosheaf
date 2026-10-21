@@ -112,6 +112,10 @@
           },
           "summary": {
             "type": "string"
+          },
+          "target_revision": {
+            "type": ["string", "null"],
+            "pattern": "^sha256:[0-9a-f]{64}$"
           }
         }
       }
@@ -261,6 +265,10 @@
         },
         "limitations": {
           "type": "string"
+        },
+        "reviewed_revision": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       },
       "allOf": [
@@ -369,6 +377,10 @@
         },
         "notes": {
           "type": "string"
+        },
+        "reviewed_revision": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       }
     },

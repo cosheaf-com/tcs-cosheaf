@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -13,6 +15,43 @@ from cosheaf.core.formal_library import validate_library_ref
 from cosheaf.core.ids import validate_artifact_id
 from cosheaf.core.status import ArtifactStatus, ArtifactType
 
+SHA256_REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_revision_hash(value: str | None) -> str | None:
+    """Validate an optional sha256 content revision hash."""
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if not SHA256_REVISION_PATTERN.fullmatch(normalized):
+        raise ValueError("revision hash must use sha256:<64 lowercase hex>")
+    return normalized
+
+
+class ArtifactRevision(BaseModel):
+    """Deterministic semantic revision descriptor for an artifact."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_id: str
+    content_hash: str
+    depends_on: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("artifact_id")
+    @classmethod
+    def _validate_artifact_id(cls, value: str) -> str:
+        return validate_artifact_id(value)
+
+    @field_validator("content_hash")
+    @classmethod
+    def _validate_content_hash(cls, value: str) -> str:
+        validated = validate_revision_hash(value)
+        if validated is None:
+            raise ValueError("content_hash must not be empty")
+        return validated
+
 
 class Evidence(BaseModel):
     """A repository-local evidence reference."""
@@ -22,6 +61,12 @@ class Evidence(BaseModel):
     kind: str
     path: str
     summary: str
+    target_revision: str | None = None
+
+    @field_validator("target_revision")
+    @classmethod
+    def _validate_target_revision(cls, value: str | None) -> str | None:
+        return validate_revision_hash(value)
 
 
 class ReviewRef(BaseModel):
@@ -39,6 +84,12 @@ class ReviewRef(BaseModel):
         "accepted",
     ] = "none"
     notes: str = ""
+    reviewed_revision: str | None = None
+
+    @field_validator("reviewed_revision")
+    @classmethod
+    def _validate_reviewed_revision(cls, value: str | None) -> str | None:
+        return validate_revision_hash(value)
 
 
 class SourceMetadata(BaseModel):
@@ -157,6 +208,12 @@ class AlignmentReview(BaseModel):
     reviewed_at: datetime | None = None
     convention_notes: list[str] = Field(default_factory=list)
     limitations: str = ""
+    reviewed_revision: str | None = None
+
+    @field_validator("reviewed_revision")
+    @classmethod
+    def _validate_reviewed_revision(cls, value: str | None) -> str | None:
+        return validate_revision_hash(value)
 
     @field_validator("reviewer", "limitations")
     @classmethod
@@ -369,6 +426,119 @@ class BaseArtifact(BaseModel):
         if isinstance(created_at, datetime) and value < created_at:
             raise ValueError("updated_at must be greater than or equal to created_at")
         return value
+
+    @property
+    def content_revision(self) -> str:
+        """Return the deterministic semantic content hash of this artifact."""
+        return compute_artifact_revision(self)
+
+    def revision_info(self) -> ArtifactRevision:
+        """Return the structured ArtifactRevision descriptor for this artifact."""
+        return build_artifact_revision(self)
+
+
+def compute_artifact_revision(artifact: BaseArtifact) -> str:
+    """Compute a deterministic sha256 content hash over semantic artifact fields."""
+    payload = {
+        "id": artifact.id,
+        "type": artifact.type.value,
+        "title": artifact.title,
+        "domain": list(artifact.domain),
+        "statement": artifact.statement,
+        "depends_on": list(artifact.depends_on),
+        "supersedes": list(artifact.supersedes),
+        "formalizations": [
+            item.model_dump(mode="json") for item in artifact.formalizations
+        ],
+        "verification_policy": artifact.verification_policy.model_dump(mode="json"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def build_artifact_revision(artifact: BaseArtifact) -> ArtifactRevision:
+    """Build an ArtifactRevision descriptor for an artifact."""
+    return ArtifactRevision(
+        artifact_id=artifact.id,
+        content_hash=compute_artifact_revision(artifact),
+        depends_on=tuple(artifact.depends_on),
+    )
+
+
+HUMAN_PROMOTION_REVIEW_DECISIONS = frozenset(
+    {
+        "approve",
+        "accept_for_private_use",
+        "accept_for_public_candidate",
+    }
+)
+
+
+def review_revision_mismatch(
+    artifact: BaseArtifact,
+    records: Any = (),
+) -> str | None:
+    """Return an error message if a human review targets a stale revision."""
+    current_revision = artifact.content_revision
+    if (
+        artifact.review.reviewed_revision is not None
+        and artifact.review.reviewed_revision != current_revision
+    ):
+        return (
+            "stale_review: review was recorded for revision "
+            f"{artifact.review.reviewed_revision}, but current artifact revision "
+            f"is {current_revision} for {artifact.id}"
+        )
+
+    matching_decisions: list[tuple[datetime, str, str]] = []
+    for item in records:
+        record = getattr(item, "record", item)
+        if getattr(record, "type", None) != "review":
+            continue
+        if getattr(record, "target", None) != artifact.id:
+            continue
+        if getattr(record, "status", None) not in {"human_reviewed", "accepted"}:
+            continue
+        if getattr(record, "decision", None) not in HUMAN_PROMOTION_REVIEW_DECISIONS:
+            continue
+        rev = getattr(record, "reviewed_revision", None)
+        if rev is not None:
+            matching_decisions.append(
+                (getattr(record, "updated_at"), getattr(record, "id", ""), rev)
+            )
+
+    if matching_decisions:
+        matching_decisions.sort(key=lambda entry: (entry[0], entry[1]))
+        _, latest_id, latest_rev = matching_decisions[-1]
+        if latest_rev != current_revision:
+            return (
+                f"stale_review: review decision {latest_id} was recorded for "
+                f"revision {latest_rev}, but current artifact revision is "
+                f"{current_revision} for {artifact.id}"
+            )
+    return None
+
+
+def evidence_revision_mismatches(
+    artifact: BaseArtifact,
+) -> tuple[tuple[str, str], ...]:
+    """Return (path, message) pairs for evidence items bound to a stale revision."""
+    current_revision = artifact.content_revision
+    mismatches: list[tuple[str, str]] = []
+    for evidence in artifact.evidence:
+        if (
+            evidence.target_revision is not None
+            and evidence.target_revision != current_revision
+        ):
+            mismatches.append(
+                (
+                    evidence.path,
+                    f"stale_evidence: evidence {evidence.path} targets revision "
+                    f"{evidence.target_revision}, but current artifact revision "
+                    f"is {current_revision} for {artifact.id}",
+                )
+            )
+    return tuple(mismatches)
 
 
 def is_external_dependency_ref(value: str) -> bool:

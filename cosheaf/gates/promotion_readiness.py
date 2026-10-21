@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from cosheaf.core.artifact import BaseArtifact, is_external_dependency_ref
+from cosheaf.core.artifact import (
+    BaseArtifact,
+    evidence_revision_mismatches,
+    is_external_dependency_ref,
+    review_revision_mismatch,
+)
 from cosheaf.core.paths import repo_relative_posix
 from cosheaf.core.status import ArtifactStatus
 from cosheaf.gates.gatekeeper import (
@@ -286,7 +291,8 @@ def _artifact_report(
     verifier_results = _target_verifier_results(gatekeeper, artifact.id)
     reasons = (
         _status_reasons(artifact)
-        + _review_reasons(artifact)
+        + _review_reasons(artifact, records)
+        + _evidence_revision_reasons(artifact)
         + _readonly_reasons(loaded)
         + _source_metadata_reasons(
             artifact,
@@ -359,20 +365,49 @@ def _status_reasons(artifact: BaseArtifact) -> tuple[PromotionReadinessReason, .
     )
 
 
-def _review_reasons(artifact: BaseArtifact) -> tuple[PromotionReadinessReason, ...]:
-    if artifact.review.state in PROMOTION_REVIEW_STATES:
-        return ()
-    return (
+def _review_reasons(
+    artifact: BaseArtifact,
+    records: tuple[LoadedRecord, ...] = (),
+) -> tuple[PromotionReadinessReason, ...]:
+    if artifact.review.state not in PROMOTION_REVIEW_STATES:
+        return (
+            PromotionReadinessReason(
+                code="missing_review",
+                severity="blocking",
+                artifact_id=artifact.id,
+                status=artifact.review.state,
+                message=(
+                    "review.state must be human_reviewed or accepted; AI/provider "
+                    "output cannot satisfy the human review requirement"
+                ),
+            ),
+        )
+    mismatch = review_revision_mismatch(artifact, records)
+    if mismatch is not None:
+        return (
+            PromotionReadinessReason(
+                code="stale_review",
+                severity="blocking",
+                artifact_id=artifact.id,
+                status=artifact.review.state,
+                message=mismatch,
+            ),
+        )
+    return ()
+
+
+def _evidence_revision_reasons(
+    artifact: BaseArtifact,
+) -> tuple[PromotionReadinessReason, ...]:
+    return tuple(
         PromotionReadinessReason(
-            code="missing_review",
+            code="stale_evidence",
             severity="blocking",
             artifact_id=artifact.id,
-            status=artifact.review.state,
-            message=(
-                "review.state must be human_reviewed or accepted; AI/provider "
-                "output cannot satisfy the human review requirement"
-            ),
-        ),
+            source_path=evidence_path,
+            message=mismatch,
+        )
+        for evidence_path, mismatch in evidence_revision_mismatches(artifact)
     )
 
 

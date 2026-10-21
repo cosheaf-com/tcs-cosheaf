@@ -18,13 +18,33 @@ def _to_plain_data(data: Any) -> Any:
             dumped.pop("formalizations", None)
         if data.alignment == AlignmentReview():
             dumped.pop("alignment", None)
+        elif isinstance(dumped.get("alignment"), dict) and (
+            dumped["alignment"].get("reviewed_revision") is None
+        ):
+            dumped["alignment"].pop("reviewed_revision", None)
         if data.verification_policy == VerificationPolicy():
             dumped.pop("verification_policy", None)
         if not data.failure_log:
             dumped.pop("failure_log", None)
+        if isinstance(dumped.get("review"), dict) and (
+            dumped["review"].get("reviewed_revision") is None
+        ):
+            dumped["review"].pop("reviewed_revision", None)
+        if isinstance(dumped.get("evidence"), list):
+            for entry in dumped["evidence"]:
+                if isinstance(entry, dict) and entry.get("target_revision") is None:
+                    entry.pop("target_revision", None)
         return dumped
     if isinstance(data, BaseModel):
-        return data.model_dump(mode="json")
+        dumped = data.model_dump(mode="json")
+        if isinstance(dumped, dict) and dumped.get("reviewed_revision") is None:
+            dumped.pop("reviewed_revision", None)
+        return dumped
+    if isinstance(data, dict):
+        copied = dict(data)
+        if "reviewed_revision" in copied and copied["reviewed_revision"] is None:
+            copied.pop("reviewed_revision", None)
+        return copied
     return data
 
 

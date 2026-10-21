@@ -50,6 +50,10 @@
     "target": {
       "type": "string"
     },
+    "reviewed_revision": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "summary": {
       "type": "string"
     },

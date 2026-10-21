@@ -18,7 +18,7 @@ from pydantic import (
 )
 from yaml import YAMLError
 
-from cosheaf.core.artifact import BaseArtifact
+from cosheaf.core.artifact import BaseArtifact, validate_revision_hash
 from cosheaf.core.ids import validate_artifact_id
 from cosheaf.core.paths import is_yaml_path, repo_relative_posix
 from cosheaf.core.status import ArtifactType
@@ -147,11 +147,17 @@ class ReviewRecord(BaseModel):
         "refute_candidate",
         "mark_obsolete",
     ]
+    reviewed_revision: str | None = None
 
     @field_validator("id", "target")
     @classmethod
     def _validate_id_reference(cls, value: str) -> str:
         return validate_artifact_id(value)
+
+    @field_validator("reviewed_revision")
+    @classmethod
+    def _validate_reviewed_revision(cls, value: str | None) -> str | None:
+        return validate_revision_hash(value)
 
 
 LoadedModel = BaseArtifact | IssueRecord | ReviewRecord | AgentTask

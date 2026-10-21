@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cosheaf.core.artifact import BaseArtifact, Evidence
+from cosheaf.core.artifact import (
+    BaseArtifact,
+    Evidence,
+    evidence_revision_mismatches,
+    review_revision_mismatch,
+)
 from cosheaf.core.status import ArtifactStatus, expected_status_for_path
 from cosheaf.gates.schema_gate import ValidationFailure
 from cosheaf.storage.loader import LoadedRecord
@@ -20,20 +25,30 @@ def validate_status_paths(records: tuple[LoadedRecord, ...]) -> list[ValidationF
         if not isinstance(record, BaseArtifact):
             continue
         allowed = expected_status_for_path(_status_path_for_loaded_record(loaded))
-        if record.status in allowed:
-            continue
-        failures.append(
-            ValidationFailure(
-                gate="status/path",
-                source_path=loaded.source_path.as_posix(),
-                artifact_id=record.id,
-                message=(
-                    "status/path mismatch: "
-                    f"status {record.status.value} is not allowed here; "
-                    f"expected one of {_format_statuses(allowed)}"
-                ),
+        if record.status not in allowed:
+            failures.append(
+                ValidationFailure(
+                    gate="status/path",
+                    source_path=loaded.source_path.as_posix(),
+                    artifact_id=record.id,
+                    message=(
+                        "status/path mismatch: "
+                        f"status {record.status.value} is not allowed here; "
+                        f"expected one of {_format_statuses(allowed)}"
+                    ),
+                )
             )
-        )
+        if record.status is ArtifactStatus.ACCEPTED:
+            mismatch = review_revision_mismatch(record, records)
+            if mismatch is not None:
+                failures.append(
+                    ValidationFailure(
+                        gate="status/path",
+                        source_path=loaded.source_path.as_posix(),
+                        artifact_id=record.id,
+                        message=mismatch,
+                    )
+                )
 
     return failures
 
@@ -56,6 +71,15 @@ def validate_evidence_paths(
         record = loaded.record
         if not isinstance(record, BaseArtifact):
             continue
+        for _, message in evidence_revision_mismatches(record):
+            failures.append(
+                ValidationFailure(
+                    gate="evidence path",
+                    source_path=loaded.source_path.as_posix(),
+                    artifact_id=record.id,
+                    message=message,
+                )
+            )
         for evidence in record.evidence:
             if _is_external_evidence(evidence):
                 continue

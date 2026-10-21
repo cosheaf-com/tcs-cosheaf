@@ -47,7 +47,9 @@ from cosheaf.core.artifact import (
     Evidence,
     FailureLogEntry,
     SourceMetadata,
+    evidence_revision_mismatches,
     is_external_dependency_ref,
+    review_revision_mismatch,
 )
 from cosheaf.core.ids import validate_artifact_id
 from cosheaf.core.paths import lifecycle_artifact_path, normalize_repo_path
@@ -762,6 +764,7 @@ class DraftWriteService:
                 details={"artifact_id": artifact.id},
             )
 
+        previous_revision = artifact.content_revision
         payload = artifact.model_dump(mode="json")
         payload.update(
             {
@@ -785,6 +788,32 @@ class DraftWriteService:
                 code="artifact_model_validation_failed",
                 remediation="Fix the draft artifact fields and retry.",
             ) from exc
+
+        if updated.content_revision != previous_revision:
+            if (
+                artifact.review.state in PROMOTION_REVIEW_STATES
+                and updated.review.reviewed_revision is None
+            ):
+                updated = updated.model_copy(
+                    update={
+                        "review": updated.review.model_copy(
+                            update={"reviewed_revision": previous_revision}
+                        )
+                    }
+                )
+            if (
+                artifact.alignment is not None
+                and artifact.alignment.status == "human_reviewed"
+                and updated.alignment is not None
+                and updated.alignment.reviewed_revision is None
+            ):
+                updated = updated.model_copy(
+                    update={
+                        "alignment": updated.alignment.model_copy(
+                            update={"reviewed_revision": previous_revision}
+                        )
+                    }
+                )
 
         result = ArtifactWriteResult(artifact=updated, relative_path=loaded.source_path)
         if dry_run:
@@ -932,11 +961,14 @@ class DraftWriteService:
         dry_run: bool = False,
     ) -> ArtifactWriteResult:
         """Append evidence metadata to a writable draft/pre-accepted artifact."""
-        evidence_payload = {
+        evidence_payload: dict[str, Any] = {
             "kind": _required_text(request, "kind"),
             "path": _required_text(request, "path"),
             "summary": _required_text(request, "summary"),
         }
+        target_revision = request.get("target_revision")
+        if target_revision is not None:
+            evidence_payload["target_revision"] = target_revision
         try:
             evidence = Evidence.model_validate(evidence_payload)
         except ValidationError as exc:
@@ -1448,6 +1480,7 @@ class ReviewDecisionService:
 
         now = _now_iso()
         checks = _review_decision_checks(request)
+        reviewed_revision = artifact.content_revision
         review_payload = {
             "id": review_id,
             "type": "review",
@@ -1457,6 +1490,7 @@ class ReviewDecisionService:
             "updated_at": now,
             "authors": [reviewer],
             "target": artifact.id,
+            "reviewed_revision": reviewed_revision,
             "summary": f"{reviewer} recorded {decision} for {artifact.id}.",
             "findings": _review_decision_findings(
                 decision=decision,
@@ -1613,7 +1647,10 @@ class PromotionActionService:
 
         gatekeeper_result = run_gatekeeper(self.context)
         _ensure_gatekeeper_allows_promotion(gatekeeper_result, artifact.id)
-        _ensure_artifact_reviewed_for_promotion(artifact)
+        _ensure_artifact_reviewed_for_promotion(
+            artifact,
+            records=validation_report.records,
+        )
         if target_status is ArtifactStatus.ACCEPTED:
             _ensure_promotion_dependencies_accepted(validation_report.records, artifact)
             _ensure_source_metadata_for_public_promotion(self.context, loaded, artifact)
@@ -1843,7 +1880,11 @@ def _artifact_after_review_decision(
         review_notes = f"{review_notes} Limitations: {limitations}"
     payload = artifact.model_dump(mode="json")
     payload["updated_at"] = datetime.now(UTC).replace(microsecond=0)
-    payload["review"] = {"state": next_state, "notes": review_notes}
+    payload["review"] = {
+        "state": next_state,
+        "notes": review_notes,
+        "reviewed_revision": artifact.content_revision,
+    }
     try:
         return BaseArtifact.model_validate(payload)
     except ValidationError as exc:
@@ -2549,16 +2590,49 @@ def _format_gatekeeper_blocking_issues(result: GatekeeperRunResult) -> str:
     )
 
 
-def _ensure_artifact_reviewed_for_promotion(artifact: BaseArtifact) -> None:
-    if artifact.review.state in PROMOTION_REVIEW_STATES:
-        return
-    raise DraftWriteServiceError(
-        "missing_review: review.state must be human_reviewed or accepted "
-        f"before promotion; {artifact.id} has {artifact.review.state}",
-        code="promotion_blocked",
-        remediation="Record an explicit human review before promotion.",
-        details={"artifact_id": artifact.id, "review_state": artifact.review.state},
-    )
+def _ensure_artifact_reviewed_for_promotion(
+    artifact: BaseArtifact,
+    *,
+    records: tuple[LoadedRecord, ...] = (),
+) -> None:
+    if artifact.review.state not in PROMOTION_REVIEW_STATES:
+        raise DraftWriteServiceError(
+            "missing_review: review.state must be human_reviewed or accepted "
+            f"before promotion; {artifact.id} has {artifact.review.state}",
+            code="promotion_blocked",
+            remediation="Record an explicit human review before promotion.",
+            details={"artifact_id": artifact.id, "review_state": artifact.review.state},
+        )
+    mismatch = review_revision_mismatch(artifact, records)
+    if mismatch is not None:
+        raise DraftWriteServiceError(
+            f"stale_review: {mismatch}",
+            code="promotion_blocked",
+            remediation=(
+                "Record a fresh human review for the current artifact revision "
+                "before promotion."
+            ),
+            details={
+                "artifact_id": artifact.id,
+                "review_state": artifact.review.state,
+                "current_revision": artifact.content_revision,
+                "reviewed_revision": artifact.review.reviewed_revision or "",
+            },
+        )
+    evidence_mismatches = evidence_revision_mismatches(artifact)
+    if evidence_mismatches:
+        raise DraftWriteServiceError(
+            f"stale_evidence: {'; '.join(msg for _, msg in evidence_mismatches)}",
+            code="promotion_blocked",
+            remediation=(
+                "Re-run verification or attach evidence matching the current "
+                "artifact revision before promotion."
+            ),
+            details={
+                "artifact_id": artifact.id,
+                "current_revision": artifact.content_revision,
+            },
+        )
 
 
 def _ensure_promotion_dependencies_accepted(

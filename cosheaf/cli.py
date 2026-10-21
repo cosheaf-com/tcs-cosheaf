@@ -57,7 +57,12 @@ from cosheaf.compare import (
 )
 from cosheaf.config.workspace import KbRootConfig, WorkspaceConfigError
 from cosheaf.context_cli import context_app
-from cosheaf.core.artifact import BaseArtifact, is_external_dependency_ref
+from cosheaf.core.artifact import (
+    BaseArtifact,
+    evidence_revision_mismatches,
+    is_external_dependency_ref,
+    review_revision_mismatch,
+)
 from cosheaf.core.ids import validate_artifact_id
 from cosheaf.core.paths import (
     lifecycle_artifact_path,
@@ -6005,7 +6010,7 @@ def _promote_artifact(
 
     gatekeeper_result = run_gatekeeper(context)
     _ensure_gatekeeper_allows_promotion(gatekeeper_result, artifact_id)
-    _ensure_artifact_reviewed_for_promotion(artifact)
+    _ensure_artifact_reviewed_for_promotion(artifact, records=records)
     _ensure_promotion_dependencies_accepted(records, artifact)
     _ensure_source_metadata_for_public_promotion(context, loaded, artifact)
 
@@ -6119,13 +6124,24 @@ def _format_gatekeeper_blocking_issues(result: GatekeeperRunResult) -> str:
     )
 
 
-def _ensure_artifact_reviewed_for_promotion(artifact: BaseArtifact) -> None:
-    if artifact.review.state in PROMOTION_REVIEW_STATES:
-        return
-    raise ArtifactLifecycleError(
-        "review.state must be human_reviewed or accepted before promotion: "
-        f"{artifact.id} has {artifact.review.state}"
-    )
+def _ensure_artifact_reviewed_for_promotion(
+    artifact: BaseArtifact,
+    *,
+    records: tuple[LoadedRecord, ...] = (),
+) -> None:
+    if artifact.review.state not in PROMOTION_REVIEW_STATES:
+        raise ArtifactLifecycleError(
+            "review.state must be human_reviewed or accepted before promotion: "
+            f"{artifact.id} has {artifact.review.state}"
+        )
+    mismatch = review_revision_mismatch(artifact, records)
+    if mismatch is not None:
+        raise ArtifactLifecycleError(f"stale_review: {mismatch}")
+    evidence_mismatches = evidence_revision_mismatches(artifact)
+    if evidence_mismatches:
+        raise ArtifactLifecycleError(
+            f"stale_evidence: {'; '.join(msg for _, msg in evidence_mismatches)}"
+        )
 
 
 def _ensure_promotion_dependencies_accepted(
