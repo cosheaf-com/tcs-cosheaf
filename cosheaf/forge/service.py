@@ -711,12 +711,14 @@ def _degraded_pr_status(
     )
 
 
+_CHECKLIST_PATTERN = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
+
+
 def _checklist(value: object) -> dict[str, object]:
     body = _text(value, "")
     items: list[dict[str, object]] = []
-    pattern = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
     for line in body.splitlines():
-        match = pattern.match(line)
+        match = _CHECKLIST_PATTERN.match(line)
         if match is None:
             continue
         checked = match.group(1).lower() == "x"
